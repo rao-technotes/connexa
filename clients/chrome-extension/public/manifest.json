@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Connexa",
+  "short_name": "Connexa",
+  "version": "0.1.0",
+  "description": "Start or join a peer-to-peer session with a 9-digit code: audio, video, screen sharing and chat.",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "Connexa",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "permissions": ["storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

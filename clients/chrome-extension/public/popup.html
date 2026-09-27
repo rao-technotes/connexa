@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <title>Connexa</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body { width: 320px; }
+    .home { min-height: 0; padding: 0; }
+    .home-card { border: 0; border-radius: 0; padding: 18px 16px; gap: 12px; }
+    .brand { font-size: 22px; }
+    .footer { display: flex; justify-content: flex-end; }
+    .footer a { color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main class="home">
+    <div class="home-card">
+      <h1 class="brand">Connexa</h1>
+      <label class="field">
+        <span>Your name</span>
+        <input id="name" maxlength="32" placeholder="Optional">
+      </label>
+      <button id="create" class="btn primary wide">Create session</button>
+      <div class="or"><span>or join one</span></div>
+      <form id="join-form" class="join-row">
+        <input id="code" inputmode="numeric" autocomplete="off" placeholder="847 291 653" aria-label="Session code">
+        <button class="btn">Join</button>
+      </form>
+      <p id="error" class="error" role="alert"></p>
+      <div class="footer"><a href="#" id="settings">Server settings</a></div>
+    </div>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

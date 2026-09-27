@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <title>Connexa settings</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="home">
+    <form class="home-card" id="form">
+      <h1 class="brand">Settings</h1>
+      <label class="field">
+        <span>Signaling server WebSocket URL</span>
+        <input id="server" required placeholder="wss://connexa.example.com/ws">
+      </label>
+      <p class="tagline" style="margin:0">Use <code>wss://</code> in production. <code>ws://</code> is only for local development.</p>
+      <button class="btn primary wide">Save</button>
+      <p id="status" class="error" role="status"></p>
+    </form>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

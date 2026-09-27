@@ -1,0 +1,12 @@
+# Automatic HTTPS (Let's Encrypt) in front of the signaling server.
+# Serves the web client and upgrades /ws to secure WebSockets (wss).
+{$CONNEXA_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(self), microphone=(self), display-capture=(self)"
+	}
+	reverse_proxy signaling:8080
+}

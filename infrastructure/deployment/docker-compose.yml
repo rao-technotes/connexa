@@ -1,0 +1,53 @@
+# Internet deployment: TLS proxy + signaling server + TURN relay.
+#
+#   cp .env.example .env   # set CONNEXA_DOMAIN, TURN_SECRET, TURN_EXTERNAL_IP
+#   docker compose up -d --build
+#
+# Open ports on the host: 80/443 (HTTPS + wss), 3478 tcp/udp (STUN/TURN),
+# 49160-49200/udp (TURN relay range).
+
+services:
+  signaling:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+    restart: unless-stopped
+    environment:
+      CONNEXA_ALLOWED_ORIGINS: ${CONNEXA_ALLOWED_ORIGINS:?set CONNEXA_ALLOWED_ORIGINS in .env}
+      CONNEXA_TRUST_PROXY: "true"
+      CONNEXA_STUN_URLS: stun:${CONNEXA_DOMAIN}:3478
+      CONNEXA_TURN_URLS: turn:${CONNEXA_DOMAIN}:3478?transport=udp,turn:${CONNEXA_DOMAIN}:3478?transport=tcp
+      CONNEXA_TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET in .env}
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CONNEXA_DOMAIN: ${CONNEXA_DOMAIN:?set CONNEXA_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - signaling
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    # Host networking avoids NAT-ing thousands of relay ports through Docker.
+    network_mode: host
+    volumes:
+      - ../turn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --static-auth-secret=${TURN_SECRET}
+      - --realm=${CONNEXA_DOMAIN}
+      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in .env}
+
+volumes:
+  caddy-data:
