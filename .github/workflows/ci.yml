@@ -65,7 +65,7 @@ jobs:
       - name: Bundle web client into the app
         working-directory: clients
         run: npm ci && npm run build:android
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
