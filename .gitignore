@@ -8,3 +8,6 @@ build/
 .vscode/
 .idea/
 *.log
+
+# Tauri generated schemas
+apps/desktop/gen/

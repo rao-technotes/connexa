@@ -1,0 +1,22 @@
+[package]
+name = "connexa-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native agent: permission-gated input injection and clipboard access for remote control"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -166,7 +166,7 @@ input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); ou
   background: var(--bad); color: #fff; font-size: 11px; line-height: 18px;
 }
 
-.toasts { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; z-index: 10; pointer-events: none; }
+.toasts { position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; z-index: 10; pointer-events: none; }
 .toast { padding: 8px 14px; border-radius: 10px; background: #22262e; color: #fff; font-size: 14px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.25); }
 
 @media (max-width: 900px) {
@@ -181,3 +181,68 @@ input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); ou
   .top-actions .btn span { display: none; }
   .code { font-size: 19px; }
 }
+
+/* ----- home extras ----- */
+.note { margin: -4px 0 0; font-size: 13px; color: var(--muted); }
+.home-links { display: flex; flex-wrap: wrap; gap: 4px 14px; justify-content: center; }
+.link { border: 0; background: none; padding: 2px; color: var(--accent); cursor: pointer; font-size: 13px; }
+.link:hover { text-decoration: underline; }
+
+/* ----- chat attachments, transfers, clipboard ----- */
+.icon-btn {
+  display: grid; place-items: center; flex: none; width: 40px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; color: var(--muted);
+}
+.icon-btn:hover { color: var(--text); }
+.messages li.transfer, .messages li.clip { display: flex; flex-direction: column; gap: 4px; min-width: 60%; }
+.file-name { font-weight: 600; overflow-wrap: anywhere; }
+.file-status { font-size: 12px; color: var(--muted); }
+.file-actions { display: flex; gap: 6px; font-size: 12px; color: var(--muted); }
+.file-actions:empty { display: none; }
+.messages progress { width: 100%; height: 6px; accent-color: var(--accent); }
+.clip-text {
+  margin: 0; max-height: 120px; overflow: auto; padding: 6px 8px; border-radius: 6px;
+  background: var(--surface); font: 12px/1.4 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+}
+
+/* ----- remote control ----- */
+.control-banner { display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--bad); }
+.control-banner .btn { background: #fff; color: var(--bad); border-color: #fff; }
+.tile-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; z-index: 2; }
+.tile-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 0; border-radius: 8px;
+  background: rgb(0 0 0 / 0.6); color: #fff; font-size: 12px; cursor: pointer;
+}
+.tile-btn:hover { background: rgb(0 0 0 / 0.8); }
+.tile-btn svg { width: 16px; height: 16px; }
+.tile.controlling::after {
+  content: ""; position: absolute; inset: 0; border: 3px solid var(--ok); border-radius: inherit; pointer-events: none; z-index: 1;
+}
+.tile:focus-visible { outline: none; }
+.tile.controlling video { cursor: crosshair; }
+.tile:fullscreen { border-radius: 0; aspect-ratio: auto; }
+.tile:fullscreen video { object-fit: contain; }
+
+/* ----- dialogs ----- */
+.dialog {
+  width: min(420px, calc(100vw - 32px)); padding: 20px; border: 1px solid var(--border); border-radius: 16px;
+  background: var(--surface); color: var(--text);
+}
+.dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+.dialog h2 { margin: 0 0 8px; font-size: 18px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.perm-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.perm-list label { display: flex; align-items: center; gap: 8px; }
+.perm-list input { width: auto; }
+.qr { display: grid; place-items: center; padding: 12px; background: #fff; border-radius: 12px; }
+.qr svg { width: 240px; height: 240px; }
+#qr-link { overflow-wrap: anywhere; text-align: center; }
+
+/* ----- LAN discovery ----- */
+.nearby { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.nearby-item {
+  width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer;
+}
+.nearby-item:hover { border-color: var(--accent); }
+code { font-size: 0.92em; }

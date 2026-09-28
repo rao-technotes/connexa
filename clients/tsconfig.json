@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["shared/src", "web/src", "chrome-extension/src"]
+  "include": ["shared/src", "web/src", "desktop/src", "android/web/src", "chrome-extension/src"]
 }

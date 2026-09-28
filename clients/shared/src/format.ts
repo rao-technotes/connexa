@@ -21,3 +21,12 @@ export function httpOriginFromWs(wsUrl: string): string {
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   return url.origin;
 }
+
+/**
+ * Random 128-bit hex id. Unlike `crypto.randomUUID`, `getRandomValues` also
+ * works outside secure contexts (e.g. a LAN page served over plain http).
+ */
+export function randomId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}

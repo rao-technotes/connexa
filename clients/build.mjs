@@ -17,15 +17,25 @@ const targets = {
     dir: join(here, "web"),
     entries: { app: "src/main.ts" },
   },
+  desktop: {
+    dir: join(here, "desktop"),
+    entries: { app: "src/main.ts" },
+  },
   extension: {
     dir: join(here, "chrome-extension"),
     entries: { popup: "src/popup.ts", session: "src/session.ts", options: "src/options.ts" },
+  },
+  android: {
+    dir: join(here, "android", "web"),
+    entries: { app: "src/main.ts" },
+    // Bundled into the APK and served by WebViewAssetLoader.
+    outdir: join(here, "android", "app", "src", "main", "assets", "www"),
   },
 };
 
 for (const [name, target] of Object.entries(targets)) {
   if (only.length && !only.includes(name)) continue;
-  const outdir = join(target.dir, "dist");
+  const outdir = target.outdir ?? join(target.dir, "dist");
   rmSync(outdir, { recursive: true, force: true });
   mkdirSync(outdir, { recursive: true });
   cpSync(join(target.dir, "public"), outdir, { recursive: true });

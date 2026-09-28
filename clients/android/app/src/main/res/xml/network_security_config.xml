@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Production servers use wss://. Plain ws:// is allowed so the app can reach a
+  development server or a desktop host in LAN mode on the local network.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

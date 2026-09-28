@@ -6,7 +6,9 @@ members = [
     "crates/connexa-protocol",
     "crates/connexa-signaling",
     "crates/connexa-security",
-    "apps/signaling-server"
+    "crates/connexa-agent",
+    "apps/signaling-server",
+    "apps/desktop"
 ]
 
 [workspace.package]
@@ -20,6 +22,8 @@ connexa-core = { path = "crates/connexa-core" }
 connexa-protocol = { path = "crates/connexa-protocol" }
 connexa-security = { path = "crates/connexa-security" }
 connexa-signaling = { path = "crates/connexa-signaling" }
+connexa-agent = { path = "crates/connexa-agent" }
+signaling-server = { path = "apps/signaling-server" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }

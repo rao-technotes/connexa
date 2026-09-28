@@ -1,0 +1,38 @@
+[package]
+name = "connexa-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Connexa for Windows: meetings, remote control and LAN sessions"
+
+[lib]
+name = "connexa_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "connexa"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+connexa-agent.workspace = true
+connexa-signaling.workspace = true
+signaling-server.workspace = true
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+mdns-sd = "0.13"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

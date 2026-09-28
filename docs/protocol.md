@@ -89,6 +89,32 @@ carrying JSON:
 |----------|------------------------------------|---------|
 | `chat`   | `id`, `text`, `ts`                 | chat message |
 | `stream` | `streamId`, `kind` (`camera`\|`screen`) | labels an incoming MediaStream |
-| `state`  | `mic`, `cam`, `screen`             | sender's media toggles |
+| `state`  | `mic`, `cam`, `screen`, `control`  | sender's media toggles; `control` = their shared screen can be remote-controlled |
+| `clipboard` | `text`                          | clipboard text shared by the sender |
+| `file-offer` | `id`, `name`, `size`, `mime`   | offer a file (receiver must accept) |
+| `file-accept` / `file-reject` / `file-cancel` | `id` | transfer decisions |
+| `control-request` | `permissions[]`           | viewer asks to control the sender's screen |
+| `control-grant` | `permissions[]`             | host approved (after a native confirmation) |
+| `control-deny` | `reason` (`declined`\|`unsupported`) | host refused, or can't be controlled |
+| `control-revoke` / `control-release` | –      | host / viewer ends control |
+| `input`  | `e` + event fields (below)         | remote input, only acted on while granted |
+
+`permissions` are drawn from `mouse`, `keyboard`, `clipboard`. Input events:
+
+| `e`      | fields |
+|----------|--------|
+| `move`   | `x`, `y` (0–1, normalized to the shared screen) |
+| `down` / `up` | `x`, `y`, `button` (`left`\|`middle`\|`right`) |
+| `wheel`  | `dx`, `dy` (pixels, as in `WheelEvent`) |
+| `key`    | `code` (`KeyboardEvent.code`), `down` |
+
+Keys are sent as physical key codes, so typing follows the host's keyboard layout.
+
+### File channels
+
+After `file-accept`, the sender opens an extra data channel labelled
+`file:<id>` and streams 16 KiB binary chunks with backpressure. The transfer
+completes when `size` bytes have arrived. Either side closing the channel or
+sending `file-cancel` aborts it.
 
 Peers treat each other's data as untrusted and validate every field.

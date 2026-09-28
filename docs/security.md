@@ -52,5 +52,37 @@ config blocks relaying to private address ranges and sets per-user quotas.
 - Data-channel messages from peers are validated and rendered as text, never as
   HTML.
 - The Chrome extension asks only for `storage`. It can't control the OS
-  keyboard or mouse. That will come from the native agent (Phase 8), and every
-  capability will need explicit, revocable consent on the controlled machine.
+  keyboard or mouse; only the desktop app can.
+- Files arrive only after the receiver clicks **Accept**. File names are
+  sanitized, and files are capped at 1 GB (200 MB on Android).
+- A shared clipboard is shown with a **Copy** button. It's written to the OS
+  clipboard automatically only when the host granted `clipboard` to that
+  participant.
+
+## Remote control
+
+Remote control is layered so that no single mistake grants control:
+
+1. **Capability.** Only the Windows desktop app can inject input, and only
+   while its user shares an **entire screen**. It advertises this with
+   `state.control`. Browsers, the extension and Android can view and request,
+   but can't be controlled.
+2. **In-app request.** A viewer's `control-request` opens a dialog on the host
+   with granular checkboxes: mouse, keyboard, clipboard (clipboard is off by
+   default).
+3. **Native confirmation.** Clicking *Allow* calls the Rust `control_grant`
+   command, which shows a Windows `MessageBox`. It defaults to **No** and names
+   the person, the permissions and the screen. Page script can't click it, so
+   even a compromised web layer can't grant control on its own.
+4. **Native enforcement.** Every `input` event is checked again in Rust by
+   `ControlGate` against that participant's grant. Events are clamped to the
+   shared monitor, and unknown keys are rejected.
+5. **Always revocable.** While anyone has control, a red banner shows who and
+   what, with a **Stop control** button. Control also ends when the host stops
+   sharing, the viewer releases it, either side leaves, or the window closes.
+   Revoking releases any keys or mouse buttons the remote side held, so
+   nothing stays stuck.
+
+Windows itself blocks injected input into elevated (administrator) windows and
+the secure desktop (UAC prompts, Ctrl+Alt+Del, the lock screen). This is
+intentional and not worked around.

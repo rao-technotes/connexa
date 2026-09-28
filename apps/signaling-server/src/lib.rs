@@ -65,13 +65,23 @@ pub fn spawn_sweeper(hub: Arc<Hub>) -> tokio::task::JoinHandle<()> {
 }
 
 pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()> {
+    serve_until(listener, state, async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutting down");
+    })
+    .await
+}
+
+/// Serve until `shutdown` resolves. Used by the desktop app's LAN mode.
+pub async fn serve_until(
+    listener: TcpListener,
+    state: AppState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let sweeper = spawn_sweeper(state.hub.clone());
     let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutting down");
-        })
+        .with_graceful_shutdown(shutdown)
         .await;
     sweeper.abort();
     result

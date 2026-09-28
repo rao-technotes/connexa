@@ -1,3 +1,4 @@
+import { randomId } from "./format";
 import { Emitter } from "./emitter";
 import type { IceServerConfig, ParticipantId, ParticipantInfo } from "./protocol";
 import type { SignalingClient } from "./signaling";
@@ -10,6 +11,8 @@ export interface MediaState {
   mic: boolean;
   cam: boolean;
   screen: boolean;
+  /** This participant's shared screen can be remote-controlled (native agent + whole monitor shared). */
+  control: boolean;
 }
 
 export interface ChatMessage {
@@ -19,11 +22,16 @@ export interface ChatMessage {
   ts: number;
 }
 
-/** Messages exchanged peer-to-peer over the data channel (never via the server). */
-type ChannelMessage =
+/**
+ * Messages exchanged peer-to-peer over the control data channel (never via the server).
+ * The mesh handles chat/stream/state itself; everything else is surfaced as a
+ * "message" event for feature modules (file transfer, remote control, clipboard).
+ */
+export type PeerMessage =
   | { t: "chat"; id: string; text: string; ts: number }
   | { t: "stream"; streamId: string; kind: StreamKind }
-  | { t: "state"; mic: boolean; cam: boolean; screen: boolean };
+  | ({ t: "state" } & MediaState)
+  | { t: string; [key: string]: unknown };
 
 type Events = {
   "peer-added": ParticipantId;
@@ -35,9 +43,15 @@ type Events = {
   "remote-stream-removed": { peerId: ParticipantId; streamId: string };
   "remote-media": { peerId: ParticipantId; state: MediaState };
   chat: ChatMessage;
+  /** A peer message not handled by the mesh itself. Untrusted: validate before use. */
+  message: { peerId: ParticipantId; msg: { t: string; [key: string]: unknown } };
+  /** A data channel opened by the remote peer (e.g. a file transfer). */
+  channel: { peerId: ParticipantId; channel: RTCDataChannel };
 };
 
 const MAX_CHAT_CHARS = 4000;
+/** Upper bound for any control-channel message (clipboard text is the largest). */
+const MAX_MESSAGE_CHARS = 256 * 1024;
 
 class Peer {
   readonly pc: RTCPeerConnection;
@@ -69,7 +83,7 @@ class Peer {
 export class PeerMesh extends Emitter<Events> {
   private peers = new Map<ParticipantId, Peer>();
   private local = new Map<StreamKind, MediaStream>();
-  private media: MediaState = { mic: false, cam: false, screen: false };
+  private media: MediaState = { mic: false, cam: false, screen: false, control: false };
   private statsTimer: number;
   private unsubscribe: Array<() => void> = [];
 
@@ -92,6 +106,34 @@ export class PeerMesh extends Emitter<Events> {
 
   get mediaState(): MediaState {
     return { ...this.media };
+  }
+
+  peerIds(): ParticipantId[] {
+    return [...this.peers.keys()];
+  }
+
+  /** The shared screen track's settings (surface type, size), if sharing. */
+  get screenSettings(): MediaTrackSettings | null {
+    return this.local.get("screen")?.getVideoTracks()[0]?.getSettings() ?? null;
+  }
+
+  /** Whether remote control of our shared screen is currently offered to peers. */
+  setControlAvailable(available: boolean): void {
+    if (this.media.control !== available) this.setMedia({ control: available });
+  }
+
+  send(peerId: ParticipantId, msg: PeerMessage): boolean {
+    const peer = this.peers.get(peerId);
+    if (!peer || peer.channel.readyState !== "open") return false;
+    peer.channel.send(JSON.stringify(msg));
+    return true;
+  }
+
+  /** Open an extra reliable data channel to one peer (arrives as a "channel" event there). */
+  createChannel(peerId: ParticipantId, label: string): RTCDataChannel | null {
+    const peer = this.peers.get(peerId);
+    if (!peer || peer.pc.connectionState === "closed") return null;
+    return peer.pc.createDataChannel(label, { ordered: true });
   }
 
   connectTo(participants: ParticipantInfo[]): void {
@@ -158,6 +200,7 @@ export class PeerMesh extends Emitter<Events> {
   stopScreenShare(): void {
     const stream = this.local.get("screen");
     if (!stream) return;
+    this.media.control = false;
     this.local.delete("screen");
     stream.getTracks().forEach((t) => {
       t.stop();
@@ -172,7 +215,7 @@ export class PeerMesh extends Emitter<Events> {
   sendChat(text: string): void {
     const trimmed = text.trim().slice(0, MAX_CHAT_CHARS);
     if (!trimmed) return;
-    const msg: ChatMessage = { id: crypto.randomUUID(), from: this.selfId, text: trimmed, ts: Date.now() };
+    const msg: ChatMessage = { id: randomId(), from: this.selfId, text: trimmed, ts: Date.now() };
     this.broadcast({ t: "chat", id: msg.id, text: msg.text, ts: msg.ts });
     this.emit("chat", msg);
   }
@@ -263,6 +306,7 @@ export class PeerMesh extends Emitter<Events> {
       this.sendTo(peer, { t: "state", ...this.media });
     };
     channel.onmessage = (ev) => this.onChannelMessage(peer, ev.data);
+    pc.ondatachannel = ({ channel: extra }) => this.emit("channel", { peerId: id, channel: extra });
 
     for (const stream of this.local.values()) {
       stream.getTracks().forEach((t) => this.addTrack(peer, t, stream));
@@ -340,8 +384,8 @@ export class PeerMesh extends Emitter<Events> {
   }
 
   private onChannelMessage(peer: Peer, data: unknown): void {
-    if (typeof data !== "string" || data.length > MAX_CHAT_CHARS * 4) return;
-    let msg: ChannelMessage;
+    if (typeof data !== "string" || data.length > MAX_MESSAGE_CHARS) return;
+    let msg: PeerMessage;
     try {
       msg = JSON.parse(data);
     } catch {
@@ -369,17 +413,26 @@ export class PeerMesh extends Emitter<Events> {
       case "state":
         this.emit("remote-media", {
           peerId: peer.id,
-          state: { mic: msg.mic === true, cam: msg.cam === true, screen: msg.screen === true },
+          state: {
+            mic: msg.mic === true,
+            cam: msg.cam === true,
+            screen: msg.screen === true,
+            control: msg.control === true,
+          },
         });
         break;
+      default:
+        if (typeof msg?.t === "string") {
+          this.emit("message", { peerId: peer.id, msg: msg as { t: string; [key: string]: unknown } });
+        }
     }
   }
 
-  private broadcast(msg: ChannelMessage): void {
+  broadcast(msg: PeerMessage): void {
     for (const peer of this.peers.values()) this.sendTo(peer, msg);
   }
 
-  private sendTo(peer: Peer, msg: ChannelMessage): void {
+  private sendTo(peer: Peer, msg: PeerMessage): void {
     if (peer.channel.readyState === "open") peer.channel.send(JSON.stringify(msg));
   }
 

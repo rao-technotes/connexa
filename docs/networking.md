@@ -36,11 +36,36 @@ Browsers expose `getUserMedia` and `getDisplayMedia` only in secure contexts:
 server behind HTTPS (see `infrastructure/deployment`). A plain `http://192.168.x.x`
 page can signal and chat, but can't use the mic, camera or screen share.
 
-## LAN mode (planned, Phase 10)
+## LAN mode
 
-`connexa-signaling` has no transport dependencies, so a desktop client can embed
-the same `Hub` and serve `/ws` on the LAN. On a LAN, ICE host candidates connect
-directly and need neither STUN nor TURN.
+The desktop app can host a session with no Internet server at all:
+
+```text
+Host EXE (192.168.1.10)
+  ├── temporary signaling server  :47800  (same Hub + web client as the cloud server)
+  ├── mDNS advert  _connexa._tcp.local.
+  └── WebRTC peer
+        ▲            ▲             ▲
+     Desktop      Browser       Android
+   (finds it     (opens the     (server URL
+   via mDNS)     link / QR)     ws://192.168.1.10:47800/ws)
+```
+
+- **LAN mode → Host a session on this network** starts the embedded server on
+  port 47800 (or a free port), creates the room, and shows an invite link and a
+  QR code.
+- Other desktop apps see the host under **Nearby sessions**, found by mDNS, and
+  still need the 9-digit code to join. The advert contains only a display name
+  and port, never the code.
+- The server shuts down when the host's meeting ends or the app closes.
+- No STUN or TURN is configured: peers on one LAN connect through host
+  candidates.
+- Windows asks once to allow Connexa through the firewall on private networks.
+
+Browsers that open the LAN link (`http://192.168.x.x:47800`) can watch screens,
+chat, exchange files and request control. They can't send their own camera,
+mic or screen, because browsers allow that only on HTTPS. Use the desktop or
+Android app for two-way media on a LAN.
 
 ## Server configuration
 
