@@ -1,10 +1,14 @@
-# Internet deployment: TLS proxy + signaling server + TURN relay.
+# Single-host Internet deployment:
+#   Caddy (TLS) + signaling server (with SFU) + Postgres + coturn (TURN)
+#   and, with `--profile monitoring`, Prometheus + Grafana.
 #
-#   cp .env.example .env   # set CONNEXA_DOMAIN, TURN_SECRET, TURN_EXTERNAL_IP
+#   cp .env.example .env      # fill in the values
 #   docker compose up -d --build
+#   docker compose --profile monitoring up -d   # optional dashboards
 #
-# Open ports on the host: 80/443 (HTTPS + wss), 3478 tcp/udp (STUN/TURN),
-# 49160-49200/udp (TURN relay range).
+# Open on the host: 80/443 tcp (HTTPS + wss), 3478 tcp/udp (STUN/TURN),
+# 3479 udp (SFU media), 49160-49200 udp (TURN relay range).
+# For several signaling nodes, use the Kubernetes manifests in ../kubernetes.
 
 services:
   signaling:
@@ -18,8 +22,33 @@ services:
       CONNEXA_STUN_URLS: stun:${CONNEXA_DOMAIN}:3478
       CONNEXA_TURN_URLS: turn:${CONNEXA_DOMAIN}:3478?transport=udp,turn:${CONNEXA_DOMAIN}:3478?transport=tcp
       CONNEXA_TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET in .env}
+      CONNEXA_DATABASE_URL: postgres://connexa:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/connexa
+      CONNEXA_METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env}
+      # Large meetings through the built-in SFU.
+      CONNEXA_SFU: "true"
+      CONNEXA_SFU_UDP_PORT: "3479"
+      CONNEXA_SFU_PUBLIC_IP: ${PUBLIC_IP:?set PUBLIC_IP in .env}
     expose:
       - "8080"
+    ports:
+      - "3479:3479/udp"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: connexa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: connexa
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "connexa"]
+      interval: 5s
+      retries: 10
 
   caddy:
     image: caddy:2
@@ -47,7 +76,39 @@ services:
       - /etc/coturn/turnserver.conf
       - --static-auth-secret=${TURN_SECRET}
       - --realm=${CONNEXA_DOMAIN}
-      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in .env}
+      - --external-ip=${PUBLIC_IP}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: [monitoring]
+    restart: unless-stopped
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN}
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --config.expand-env
+      - --storage.tsdb.retention.time=30d
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: [monitoring]
+    restart: unless-stopped
+    ports:
+      # Bound to localhost: reach it over an SSH tunnel.
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
 
 volumes:
   caddy-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

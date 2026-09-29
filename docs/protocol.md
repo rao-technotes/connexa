@@ -21,32 +21,53 @@ files travel peer-to-peer and never reach it.
 
 | type            | fields                                         | notes |
 |-----------------|------------------------------------------------|-------|
-| `create_room`   | `display_name?`                                | creator becomes host |
-| `join_room`     | `room_id`, `display_name?`                     | `room_id` may contain spaces/dashes |
+| `create_room`   | `display_name?`, `pin?`, `lobby?`, `large?`    | creator becomes host; `large` asks for an SFU room |
+| `join_room`     | `room_id`, `display_name?`, `pin?`             | `room_id` may contain spaces/dashes |
 | `resume`        | `room_id`, `participant_id`, `resume_token`    | re-attach after a dropped socket |
 | `leave_room`    | –                                              | host leaving ends the room |
 | `end_room`      | –                                              | host only |
+| `admit` / `deny` | `request_id`                                  | host only: answer a lobby request |
 | `sdp_offer`     | `target`, `sdp`                                | relayed to `target` only |
 | `sdp_answer`    | `target`, `sdp`                                | |
 | `ice_candidate` | `target`, `candidate` (`RTCIceCandidateInit`)  | opaque to the server |
+| `sfu_offer`     | `sdp`                                          | SFU rooms: publisher connection offer |
+| `sfu_answer`    | `sdp`                                          | SFU rooms: subscriber connection answer |
+| `sfu_candidate` | `pc` (`pub`\|`sub`), `candidate`               | SFU rooms: trickle ICE |
+| `device_hello`  | `public_key` (SPKI, base64), `name?`, `platform?` | start a device-key proof |
+| `device_proof`  | `signature` (P1363, base64)                    | ECDSA P-256/SHA-256 over `"connexa-device-auth:" + nonce` |
+| `trust_device`  | `device_id`, `trusted`                         | verified devices only |
+| `list_trusted_devices` / `get_activity` | –                      | verified devices only |
+| `report_event`  | `kind`, `subject?`                             | audit a P2P event (`control_granted`, `file_received`, …) |
 | `ping`          | –                                              | keeps the socket and room alive |
 
 ## Server → client
 
 | type                 | fields |
 |----------------------|--------|
-| `room_created`       | `room_id`, `participant_id`, `resume_token`, `max_participants`, `ice_servers` |
-| `room_joined`        | `room_id`, `participant_id`, `resume_token`, `host_id`, `participants[]`, `max_participants`, `ice_servers` |
+| `room_created`       | `room_id`, `participant_id`, `resume_token`, `max_participants`, `ice_servers`, `topology`, `security` |
+| `room_joined`        | `room_id`, `participant_id`, `resume_token`, `host_id`, `participants[]`, `max_participants`, `ice_servers`, `topology`, `security` |
+| `lobby_waiting`      | `room_id`: the joiner waits for the host |
+| `join_request`       | `request_id`, `display_name`, `device_id?`: to the host |
+| `join_request_cancelled` | `request_id` |
 | `session_resumed`    | `room_id`, `participant_id`, `host_id`, `participants[]` |
 | `participant_joined` | `participant` |
 | `participant_left`   | `participant_id` |
 | `sdp_offer` / `sdp_answer` | `from`, `sdp` |
 | `ice_candidate`      | `from`, `candidate` |
-| `room_ended`         | `reason`: `host_ended` \| `host_left` \| `expired` |
+| `sfu_offer` / `sfu_answer` / `sfu_candidate` | as above, from the SFU |
+| `device_challenge`   | `nonce` |
+| `device_verified`    | `device_id` (`xxxx-xxxx-xxxx-xxxx`) |
+| `trusted_devices`    | `devices[]` (`device_id`, `name`, `platform`, `last_seen`) |
+| `activity`           | `events[]` (`at`, `kind`, `actor?`, `subject?`) |
+| `room_ended`         | `reason`: `host_ended` \| `host_left` \| `expired` \| `server_lost` |
 | `error`              | `code`, `message` |
 | `pong`               | – |
 
-`participants[]` entries are `{ participant_id, display_name, is_host }` and
+`topology` is `mesh` or `sfu`; `security` is `{ pin, lobby }`. New error codes:
+`pin_required`, `wrong_pin`, `invalid_pin`, `join_denied`, `not_verified`,
+`unavailable` (e.g. large rooms without an SFU).
+
+`participants[]` entries are `{ participant_id, display_name, is_host, device_id? }` and
 exclude the receiver. `ice_servers` follows the browser `RTCIceServer` shape and
 may contain short-lived TURN credentials minted for that participant.
 
@@ -71,6 +92,26 @@ Clients use the [perfect negotiation](https://w3c.github.io/webrtc-pc/#perfect-n
 pattern: either side may send an offer at any time (e.g. when starting a screen
 share). The peer with the lexically greater `participant_id` is *polite*: on an
 offer collision it rolls back its own offer and accepts the other.
+
+## Lobby and PIN
+
+With a PIN, `join_room` must carry it (`pin_required` / `wrong_pin`). After
+5 wrong guesses the room pauses new joins for 5 minutes. With a lobby, the
+joiner gets `lobby_waiting` and the host a `join_request`. The host answers
+with `admit` or `deny`, and the joiner receives `room_joined` or a
+`join_denied` error. Joiners whose verified device the host trusts are
+admitted directly.
+
+## SFU rooms
+
+Each participant keeps two connections with the server's SFU. On the
+**publisher** connection the client offers (`sfu_offer`), and it carries
+upstream media and a `connexa` data channel sending `{to?, msg}`. On the
+**subscriber** connection the SFU offers, and it carries everyone else's
+tracks, whose stream ids are `<owner>~<original stream id>`, plus a `connexa`
+channel delivering `{from, msg}`. The peer messages below are identical in
+both topologies. Extra channels labelled `relay:<target>:<label>` reach the
+target as `from:<sender>:<label>`.
 
 ## Reconnection
 
@@ -98,6 +139,10 @@ carrying JSON:
 | `control-deny` | `reason` (`declined`\|`unsupported`) | host refused, or can't be controlled |
 | `control-revoke` / `control-release` | –      | host / viewer ends control |
 | `input`  | `e` + event fields (below)         | remote input, only acted on while granted |
+| `file-done` | `id`                            | receiver has every byte (the sender then marks the file sent) |
+| `nscreen-offer` | `sdp`, `streamId`           | a native (Android) screen share offers a receive-only side link |
+| `nscreen-answer` / `nscreen-ice` | `sdp` / `candidate` | side-link negotiation |
+| `nscreen-stop` | –                            | the native screen share ended |
 
 `permissions` are drawn from `mouse`, `keyboard`, `clipboard`. Input events:
 

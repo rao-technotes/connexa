@@ -1,0 +1,11 @@
+# Scrapes the signaling server's /metrics (Prometheus text format).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: connexa
+    authorization:
+      type: Bearer
+      credentials: ${METRICS_TOKEN}
+    static_configs:
+      - targets: ["signaling:8080"]

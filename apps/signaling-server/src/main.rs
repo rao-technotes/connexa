@@ -1,5 +1,9 @@
 use anyhow::Context;
-use signaling_server::{AppState, Config, serve};
+use std::sync::Arc;
+
+use signaling_server::cluster::RedisBus;
+use signaling_server::store::postgres::PgStore;
+use signaling_server::{AppState, Config, MediaFactory, Services, serve};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -40,6 +44,36 @@ async fn main() -> anyhow::Result<()> {
         warn!("CONNEXA_ALLOWED_ORIGINS is not set; accepting WebSockets from any origin");
     }
 
-    serve(listener, AppState::new(config)).await?;
+    let mut services = Services::default();
+    if let Some(url) = &config.database_url {
+        services.store = Some(Arc::new(PgStore::connect(url).await?));
+        info!("using Postgres for devices, trust and audit log");
+    } else {
+        warn!("CONNEXA_DATABASE_URL is not set; device trust and audit log are kept in memory");
+    }
+    if let Some(url) = &config.redis_url {
+        services.bus = Some(Arc::new(
+            RedisBus::connect(url)
+                .await
+                .context("connecting to Redis")?,
+        ));
+        info!(slot = config.node_slot, "clustering through Redis");
+    }
+    if config.sfu.enabled {
+        services.media = Some(sfu_factory(&config)?);
+    }
+
+    serve(listener, AppState::with_services(config, services).await?).await?;
     Ok(())
+}
+
+fn sfu_factory(config: &Config) -> anyhow::Result<MediaFactory> {
+    let settings = config.sfu.clone();
+    let ice = config.ice.clone();
+    let sfu = signaling_server::sfu::start(settings, ice)?;
+    info!(
+        udp_port = config.sfu.udp_port,
+        "SFU enabled for large rooms"
+    );
+    Ok(Box::new(move |hub| sfu.attach(hub)))
 }

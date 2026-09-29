@@ -1,0 +1,20 @@
+[package]
+name = "connexa-sfu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Selective forwarding unit for large Connexa rooms"
+
+[dependencies]
+connexa-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+bytes = "1"
+webrtc = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }

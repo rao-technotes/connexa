@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: connexa
+    folder: Connexa
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

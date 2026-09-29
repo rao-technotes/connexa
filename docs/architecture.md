@@ -21,9 +21,9 @@ users can share one room.
                                      WebView2)      Kotlin shell)
                                         │               │
                                    connexa-agent    save to Downloads,
-                                   input, clipboard camera and mic
-                                   LAN server       permissions
-                                   + mDNS
+                                   input, clipboard camera/mic permissions,
+                                   LAN server       native screen capture
+                                   + mDNS           (MediaProjection)
 ```
 
 ## Repository layout
@@ -33,10 +33,13 @@ crates/
   connexa-core        constants (protocol version, room code length, limits)
   connexa-protocol    wire types (serde), versioned envelope, encode/decode
   connexa-security    room codes, tokens, rate limiter, TURN credentials, redaction
-  connexa-signaling   transport-agnostic room Hub (cloud server and LAN mode)
+  connexa-signaling   transport-agnostic room Hub: rooms, lobby, PIN, device proofs,
+                      audit/SFU events, metrics (cloud server and LAN mode)
   connexa-agent       permission-gated input injection (SendInput), clipboard
+  connexa-sfu         selective forwarding unit for large rooms (webrtc-rs)
 apps/
-  signaling-server    Axum WebSocket transport + static web client + /healthz
+  signaling-server    Axum WebSocket transport, web client, /healthz, /metrics,
+                      store (memory/Postgres), cluster (Redis), SFU adapter
   desktop/            Windows app (Tauri 2): native commands, LAN server, mDNS
 clients/
   shared/             TypeScript: protocol, SignalingClient, PeerMesh, FileTransfers,
@@ -95,10 +98,14 @@ by Windows Graphics Capture, and Chromium's WebRTC video encoders.
 `WebViewAssetLoader`, which counts as a secure context, so the camera and
 microphone work. The shell maps WebRTC permission requests to Android runtime
 permissions, handles the file picker, and saves received files to Downloads
-through a small JS bridge. Android WebView doesn't support `getDisplayMedia`,
-so the app can join, talk, show video, chat, send and receive files, view
-screens and control a desktop host, but it can't share its own screen yet.
-That needs a native MediaProjection capture pipeline.
+through a small JS bridge.
+
+Android WebView has no `getDisplayMedia`, so screen sharing is native:
+`NativeScreenShare.kt` captures with MediaProjection (in a `mediaProjection`
+foreground service, as Android 14 requires) and sends it with Google's WebRTC
+library over a separate send-only **side link** to each viewer. The page
+relays that link's offer, answer and ICE as peer messages (`nscreen-*`), so it
+works in mesh and SFU rooms alike. Viewers show it as a normal screen tile.
 
 ## Roadmap status
 
@@ -112,11 +119,23 @@ That needs a native MediaProjection capture pipeline.
 | 6 | Chat over data channels | ✅ |
 | 7 | Windows EXE: screen capture, clipboard, file transfer | ✅ Tauri app + NSIS installer |
 | 8 | Remote control: mouse, keyboard, permissions, request/approve/revoke | ✅ Windows hosts |
-| 9 | Android client on the same protocol | ✅ except sharing its own screen |
+| 9 | Android client on the same protocol | ✅ including native screen sharing |
 | 10 | LAN mode: EXE hosts a temporary server, mDNS discovery, QR | ✅ |
 | 11 | STUN/TURN + Docker deployment | ✅ |
-| 12 | Scaling (Redis, SFU, LB, monitoring) | deliberately deferred, per plan |
+| 12 | Scaling: SFU, Redis clustering, load balancing, Kubernetes, monitoring, database | ✅ |
+| + | Session security: lobby, PIN, device identity, trusted devices, audit log | ✅ |
 
-Next candidates: Android screen sharing (MediaProjection), macOS and Linux
-desktop builds (the Tauri shell is portable; input injection needs a platform
-backend), an optional session PIN or lobby, and resumable file transfers.
+Phase 12 in detail:
+
+- **SFU:** `connexa-sfu`, used for rooms created as *Large meeting*
+  ([networking.md](networking.md#topology)).
+- **Scale-out:** Redis-backed multi-node signaling with slot-routed room codes
+  and no sticky sessions ([networking.md](networking.md#multiple-signaling-nodes)).
+- **Database:** Postgres for device identities, trust and the audit log.
+- **Operations:** Prometheus metrics, a Grafana dashboard, and Kubernetes and
+  Compose deployments ([deployment.md](deployment.md)).
+
+Next candidates: macOS and Linux desktop builds (the Tauri shell is portable,
+but input injection needs a platform backend), simulcast in the SFU so
+viewers get quality matched to their bandwidth, end-to-end encryption through
+the SFU (SFrame), and resumable file transfers.

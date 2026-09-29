@@ -6,15 +6,17 @@ temporary **9-digit session code**:
 > Start a session → get `847 291 653` → share it → others enter it → connected.
 
 Audio, video, screen sharing, chat, file transfer and remote control run
-directly between participants over WebRTC. A small Rust server only
-coordinates rooms, and the Windows app can host that server itself on a LAN.
+directly between participants over WebRTC. A small Rust server coordinates
+rooms. For meetings too big for peer-to-peer, it includes its own SFU, written
+in Rust. The Windows app can host a server itself on a LAN.
 
 ## Screenshots
 
 Captured from real sessions running against the local server. Chrome's
 built-in fake camera stands in for webcams, and the shared "screens" are
-generated images. The remote-control shots use the desktop UI with the native
-layer stubbed, so no real input was injected.
+generated images. Stubs replace two native layers: remote control (no real
+input was injected) and Android capture (a simulated bridge feeds the real
+Android web bundle).
 
 | Start or join | Three people, P2P chat |
 |---|---|
@@ -32,6 +34,14 @@ layer stubbed, so no real input was injected.
 |---|---|
 | ![LAN QR](docs/screenshots/desktop-lan-qr.png) | ![LAN session](docs/screenshots/desktop-lan-session.png) |
 
+| Large meeting: 5 people through the Rust SFU | Lobby: host approves a verified device |
+|---|---|
+| ![SFU meeting](docs/screenshots/sfu-meeting.png) | ![Lobby](docs/screenshots/lobby-request.png) |
+
+| This device: ID, trusted devices, activity log | Android screen share (native capture, simulated) |
+|---|---|
+| ![Device page](docs/screenshots/device-page.png) | ![Android screen](docs/screenshots/android-screen-share.png) |
+
 | Phone layout | Chrome extension |
 |---|---|
 | <img src="docs/screenshots/mobile.png" alt="Mobile view" width="260"> | <img src="docs/screenshots/extension-popup.png" alt="Extension popup" width="260"> |
@@ -42,17 +52,26 @@ layer stubbed, so no real input was injected.
 |---|:-:|:-:|:-:|:-:|
 | Create or join with a 9-digit code | ✅ | ✅ | ✅ | ✅ |
 | Mic, camera, P2P chat | ✅ | ✅ | ✅ | ✅ |
-| Share screen / window / tab | ✅ | ✅ | ✅ | view only |
+| Share screen / window / tab | ✅ | ✅ | ✅ | ✅ (whole screen, native) |
 | Send and receive files | ✅ | ✅ | ✅ | ✅ |
 | Share clipboard text | ✅ | ✅ | ✅ | ✅ |
 | Request control of a remote screen | ✅ | ✅ | ✅ | ✅ |
 | **Be** remote-controlled (mouse/keyboard) | – | – | ✅ | – |
 | LAN mode: host a session without a server | – | – | ✅ | join by URL |
+| Large meetings (up to 25, via SFU) | ✅ | ✅ | ✅ | ✅ |
+| PIN, lobby, verified devices, trusted devices | ✅ | ✅ | ✅ | ✅ |
 
-The Rust server also handles presence, SDP/ICE relay, host end, room expiry,
-rate limiting and reconnect with session resume. It deploys with Docker behind
-automatic HTTPS (Caddy) with a TURN relay (coturn). Each link is labelled
-**P2P** (direct) or **Relay** (TURN).
+The Rust server also handles:
+- **Rooms:** presence, SDP/ICE relay, host end, room expiry, rate limiting, and
+  reconnect with session resume.
+- **Large meetings:** a built-in SFU. Each link is labelled **P2P** (direct),
+  **Relay** (TURN) or **SFU** (large meeting).
+- **Security:** PIN, lobby, device-key verification, trusted devices and a
+  per-device audit log (Postgres).
+- **Operations:** multi-node clustering over Redis and Prometheus metrics.
+
+It deploys with Docker Compose (Caddy HTTPS, Postgres, coturn, and optional
+Prometheus + Grafana) or Kubernetes. See [docs/deployment.md](docs/deployment.md).
 
 Remote control needs explicit consent on the controlled machine: an in-app
 request with per-permission checkboxes, then a native Windows confirmation.
@@ -128,14 +147,19 @@ npm --prefix clients run typecheck
 
 ## Deploy
 
-See [infrastructure/deployment](infrastructure/deployment): copy
-`.env.example` to `.env`, fill it in, then run `docker compose up -d --build`.
-Browsers need HTTPS for the camera, mic and screen sharing anywhere except
-`localhost`.
+- **One host:** in `infrastructure/deployment`, copy `.env.example` to `.env`,
+  fill it in, then run `docker compose up -d --build`. Add
+  `--profile monitoring` for Prometheus and Grafana.
+- **Kubernetes:** `kubectl apply -k infrastructure/kubernetes`, which runs 3
+  signaling nodes with Redis and Postgres.
+
+Details are in [docs/deployment.md](docs/deployment.md). Browsers need HTTPS
+for the camera, mic and screen sharing anywhere except `localhost`.
 
 ## Docs
 
 - [Architecture and roadmap](docs/architecture.md)
 - [Signaling and peer protocol](docs/protocol.md)
 - [Security model, including remote control](docs/security.md)
-- [Networking, LAN mode, STUN/TURN and configuration](docs/networking.md)
+- [Networking, SFU, clustering, LAN mode and configuration](docs/networking.md)
+- [Deployment and monitoring](docs/deployment.md)

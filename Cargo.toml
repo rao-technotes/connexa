@@ -7,6 +7,7 @@ members = [
     "crates/connexa-signaling",
     "crates/connexa-security",
     "crates/connexa-agent",
+    "crates/connexa-sfu",
     "apps/signaling-server",
     "apps/desktop"
 ]
@@ -23,6 +24,7 @@ connexa-protocol = { path = "crates/connexa-protocol" }
 connexa-security = { path = "crates/connexa-security" }
 connexa-signaling = { path = "crates/connexa-signaling" }
 connexa-agent = { path = "crates/connexa-agent" }
+connexa-sfu = { path = "crates/connexa-sfu" }
 signaling-server = { path = "apps/signaling-server" }
 
 tokio = { version = "1", features = ["full"] }

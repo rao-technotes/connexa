@@ -47,4 +47,6 @@ tasks.named("preBuild") {
 
 dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
+    // Native WebRTC for screen sharing (WebView has no getDisplayMedia).
+    implementation("io.getstream:stream-webrtc-android:1.3.10")
 }

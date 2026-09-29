@@ -1,0 +1,29 @@
+# HTTPS + wss for the web client and signaling (ingress-nginx + cert-manager).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: connexa
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    # Long-lived WebSockets.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # /metrics stays internal.
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = /metrics { return 404; }
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [connexa.example.com]
+      secretName: connexa-tls
+  rules:
+    - host: connexa.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: connexa-signaling
+                port:
+                  name: http

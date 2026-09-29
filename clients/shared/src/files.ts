@@ -1,6 +1,6 @@
 import { randomId } from "./format";
 import { Emitter } from "./emitter";
-import type { PeerMesh } from "./mesh";
+import type { MediaSession } from "./session";
 import type { ParticipantId } from "./protocol";
 
 /**
@@ -15,6 +15,8 @@ export const MAX_FILE_BYTES = 1024 * 1024 * 1024; // held in memory by the recei
 const CHUNK_BYTES = 16 * 1024; // safe for every browser's SCTP message size
 const HIGH_WATER = 4 * 1024 * 1024;
 const LOW_WATER = 1024 * 1024;
+/** How long the sender waits for the receiver to confirm after sending the last byte. */
+const ACK_TIMEOUT_MS = 120_000;
 
 export type TransferState = "offered" | "waiting" | "active" | "done" | "rejected" | "cancelled" | "failed";
 
@@ -44,11 +46,11 @@ export class FileTransfers extends Emitter<Events> {
   private transfers = new Map<string, Internal>();
   private unsubscribe: Array<() => void>;
 
-  constructor(private readonly mesh: PeerMesh) {
+  constructor(private readonly mesh: MediaSession) {
     super();
     this.unsubscribe = [
       mesh.on("message", ({ peerId, msg }) => this.onMessage(peerId, msg)),
-      mesh.on("channel", ({ peerId, channel }) => this.onChannel(peerId, channel)),
+      mesh.on("channel", ({ peerId, channel, label }) => this.onChannel(peerId, channel, label)),
       mesh.on("peer-removed", (peerId) => {
         for (const t of this.transfers.values()) if (t.peerId === peerId) this.finish(t, "failed");
       }),
@@ -139,11 +141,14 @@ export class FileTransfers extends Emitter<Events> {
       case "file-cancel":
         if (t && t.peerId === peerId) this.finish(t, "cancelled");
         return;
+      case "file-done":
+        if (t && t.peerId === peerId && t.direction === "out" && t.bytes === t.size) this.finish(t, "done");
+        return;
     }
   }
 
-  private onChannel(peerId: ParticipantId, channel: RTCDataChannel): void {
-    const id = channel.label.startsWith("file:") ? channel.label.slice(5) : "";
+  private onChannel(peerId: ParticipantId, channel: RTCDataChannel, label: string): void {
+    const id = label.startsWith("file:") ? label.slice(5) : "";
     const t = this.transfers.get(id);
     if (!t || t.peerId !== peerId || t.direction !== "in" || t.state !== "waiting") {
       channel.close();
@@ -161,6 +166,7 @@ export class FileTransfers extends Emitter<Events> {
       if (t.bytes === t.size) {
         const blob = new Blob(t.chunks, { type: t.mime });
         t.chunks = [];
+        this.mesh.send(t.peerId, { t: "file-done", id: t.id });
         this.finish(t, "done");
         this.emit("received", { transfer: snapshot(t), blob });
       } else if (performance.now() - lastUpdate > 150) {
@@ -202,9 +208,15 @@ export class FileTransfers extends Emitter<Events> {
           this.update(t);
         }
       }
-      // Wait until everything has left the buffer before closing.
-      while (channel.bufferedAmount > 0 && t.state === "active") await sleep(50);
-      if (t.state === "active") this.finish(t, "done");
+      // Everything is queued. Keep the channel open until the receiver confirms
+      // (file-done) or closes its end: closing here could discard data still in
+      // flight, especially when an SFU relays the channel.
+      channel.onclose = () => {
+        if (t.state === "active") this.finish(t, "done");
+      };
+      setTimeout(() => {
+        if (t.state === "active") this.finish(t, "failed");
+      }, ACK_TIMEOUT_MS);
     } catch {
       if (t.state === "active") this.finish(t, "failed");
     }
@@ -257,8 +269,4 @@ export function formatBytes(n: number): string {
     i++;
   }
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

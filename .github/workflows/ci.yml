@@ -21,6 +21,25 @@ jobs:
   rust:
     name: Rust (server + libraries)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: connexa
+          POSTGRES_PASSWORD: connexa
+          POSTGRES_DB: connexa_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U connexa" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # Enables the Postgres store and Redis cluster tests.
+      CONNEXA_TEST_DATABASE_URL: postgres://connexa:connexa@localhost:5432/connexa_test
+      CONNEXA_TEST_REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +70,33 @@ jobs:
         with:
           name: connexa-chrome-extension
           path: clients/chrome-extension/dist
+
+  docker:
+    name: Server image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/docker/Dockerfile
+          # Published to ghcr.io on version tags; otherwise just built.
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/connexa-signaling:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/connexa-signaling:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   android:
     name: Android APK
@@ -113,7 +159,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [rust, clients, android, windows]
+    needs: [rust, clients, android, windows, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write

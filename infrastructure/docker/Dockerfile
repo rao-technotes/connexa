@@ -23,5 +23,6 @@ ENV CONNEXA_BIND=0.0.0.0:8080 \
     CONNEXA_WEB_ROOT=/srv/web \
     RUST_LOG=info
 USER connexa
-EXPOSE 8080
+# 8080: HTTP + WebSocket. 3479/udp: SFU media (when CONNEXA_SFU=true).
+EXPOSE 8080 3479/udp
 CMD ["signaling-server"]

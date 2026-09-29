@@ -1,14 +1,20 @@
+import { deviceKey, devicePlatform } from "./device";
 import { Emitter } from "./emitter";
 import {
   PROTOCOL_VERSION,
+  type ActivityEvent,
   type ClientMessage,
+  type DeviceSummary,
   type ErrorCode,
   type IceServerConfig,
   type ParticipantId,
   type ParticipantInfo,
   type RoomEndReason,
+  type RoomSecurity,
   type ServerMessage,
   type ServerMessageOf,
+  type SfuPc,
+  type Topology,
 } from "./protocol";
 
 export interface SessionInfo {
@@ -18,6 +24,20 @@ export interface SessionInfo {
   resumeToken: string;
   maxParticipants: number;
   iceServers: IceServerConfig[];
+  topology: Topology;
+  security: RoomSecurity;
+}
+
+export interface CreateOptions {
+  pin?: string;
+  lobby?: boolean;
+  large?: boolean;
+}
+
+export interface JoinRequest {
+  request_id: string;
+  display_name: string;
+  device_id?: string;
 }
 
 export type SignalingStatus = "connecting" | "open" | "reconnecting" | "closed";
@@ -32,10 +52,18 @@ type Events = {
   candidate: { from: ParticipantId; candidate: RTCIceCandidateInit };
   ended: RoomEndReason | "connection_lost";
   error: { code: ErrorCode; message: string };
+  /** Joiner: waiting for the host to admit us. */
+  waiting: string;
+  /** Host: someone is waiting in the lobby. */
+  "join-request": JoinRequest;
+  "join-request-cancelled": string;
+  "sfu-offer": string;
+  "sfu-answer": string;
+  "sfu-candidate": { pc: SfuPc; candidate: RTCIceCandidateInit };
 };
 
 export class SignalingError extends Error {
-  constructor(public code: ErrorCode | "connection_failed", message: string) {
+  constructor(public code: ErrorCode | "connection_failed" | "cancelled", message: string) {
     super(message);
   }
 }
@@ -59,8 +87,12 @@ export class SignalingClient extends Emitter<Events> {
   private leaving = false;
   private pingTimer: number | undefined;
   private waiters: Array<{ handle: (msg: ServerMessage) => boolean; fail: (err: Error) => void }> = [];
+  private verifiedDevice: string | null = null;
 
-  constructor(private readonly url: string) {
+  constructor(
+    private readonly url: string,
+    private readonly deviceName = "",
+  ) {
     super();
   }
 
@@ -68,9 +100,26 @@ export class SignalingClient extends Emitter<Events> {
     return this.session;
   }
 
-  async createRoom(displayName: string): Promise<{ session: SessionInfo; participants: ParticipantInfo[] }> {
+  /** This device's verified ID (null if the device key is unavailable). */
+  get deviceId(): string | null {
+    return this.verifiedDevice;
+  }
+
+  async createRoom(
+    displayName: string,
+    options: CreateOptions = {},
+  ): Promise<{ session: SessionInfo; participants: ParticipantInfo[] }> {
     await this.open();
-    const msg = await this.request({ type: "create_room", display_name: displayName }, "room_created");
+    const msg = await this.request(
+      {
+        type: "create_room",
+        display_name: displayName,
+        pin: options.pin || undefined,
+        lobby: options.lobby ?? false,
+        large: options.large ?? false,
+      },
+      "room_created",
+    );
     this.session = {
       roomId: msg.room_id,
       selfId: msg.participant_id,
@@ -78,17 +127,24 @@ export class SignalingClient extends Emitter<Events> {
       resumeToken: msg.resume_token,
       maxParticipants: msg.max_participants,
       iceServers: msg.ice_servers,
+      topology: msg.topology ?? "mesh",
+      security: msg.security ?? { pin: false, lobby: false },
     };
     this.attached = true;
     return { session: this.session, participants: [] };
   }
 
+  /** Resolves once in the room; emits "waiting" while the host decides (lobby rooms). */
   async joinRoom(
     roomId: string,
     displayName: string,
+    pin?: string,
   ): Promise<{ session: SessionInfo; participants: ParticipantInfo[] }> {
     await this.open();
-    const msg = await this.request({ type: "join_room", room_id: roomId, display_name: displayName }, "room_joined");
+    const msg = await this.request(
+      { type: "join_room", room_id: roomId, display_name: displayName, pin: pin || undefined },
+      "room_joined",
+    );
     this.session = {
       roomId: msg.room_id,
       selfId: msg.participant_id,
@@ -96,9 +152,42 @@ export class SignalingClient extends Emitter<Events> {
       resumeToken: msg.resume_token,
       maxParticipants: msg.max_participants,
       iceServers: msg.ice_servers,
+      topology: msg.topology ?? "mesh",
+      security: msg.security ?? { pin: false, lobby: false },
     };
     this.attached = true;
     return { session: this.session, participants: msg.participants };
+  }
+
+  admit(requestId: string): void {
+    this.send({ type: "admit", request_id: requestId });
+  }
+
+  deny(requestId: string): void {
+    this.send({ type: "deny", request_id: requestId });
+  }
+
+  async trustDevice(deviceId: string, trusted: boolean): Promise<DeviceSummary[]> {
+    const reply = await this.request({ type: "trust_device", device_id: deviceId, trusted }, "trusted_devices");
+    return reply.devices;
+  }
+
+  async trustedDevices(): Promise<DeviceSummary[]> {
+    return (await this.request({ type: "list_trusted_devices" }, "trusted_devices")).devices;
+  }
+
+  async activity(): Promise<ActivityEvent[]> {
+    return (await this.request({ type: "get_activity" }, "activity")).events;
+  }
+
+  /** Record a peer-to-peer event (e.g. control granted) in this device's audit log. */
+  reportEvent(kind: string, subject?: ParticipantId): void {
+    if (this.verifiedDevice) this.send({ type: "report_event", kind, subject });
+  }
+
+  /** Connect without joining a room (e.g. to manage trusted devices). */
+  async connect(): Promise<void> {
+    await this.open();
   }
 
   /** Queue-aware send for in-session messages. */
@@ -122,6 +211,9 @@ export class SignalingClient extends Emitter<Events> {
     this.session = null;
     this.attached = false;
     this.outbox = [];
+    const pending = this.waiters;
+    this.waiters = [];
+    pending.forEach((w) => w.fail(new SignalingError("cancelled", "The connection was closed.")));
     window.clearInterval(this.pingTimer);
     const ws = this.ws;
     this.ws = null;
@@ -145,7 +237,8 @@ export class SignalingClient extends Emitter<Events> {
         window.clearInterval(this.pingTimer);
         this.pingTimer = window.setInterval(() => this.raw({ type: "ping" }), PING_INTERVAL_MS);
         this.emit("status", "open");
-        resolve();
+        // Prove the device key first so the server can attach our device ID.
+        void this.proveDevice().finally(() => resolve());
       };
       ws.onerror = () => {
         if (!settled) {
@@ -170,6 +263,32 @@ export class SignalingClient extends Emitter<Events> {
       };
       ws.onmessage = (ev) => this.dispatch(ev.data);
     });
+  }
+
+  private async proveDevice(): Promise<void> {
+    try {
+      const key = await deviceKey();
+      if (!key) return;
+      const challenge = await this.request(
+        {
+          type: "device_hello",
+          public_key: key.publicKey,
+          name: this.deviceName || undefined,
+          platform: devicePlatform(),
+        },
+        "device_challenge",
+      );
+      const verified = await this.request(
+        { type: "device_proof", signature: await key.sign(challenge.nonce) },
+        "device_verified",
+      );
+      this.verifiedDevice = verified.device_id;
+    } catch (err) {
+      // Identity is optional: sessions still work unverified.
+      if (!(err instanceof SignalingError && err.code === "connection_failed")) {
+        console.warn("device verification failed", err);
+      }
+    }
   }
 
   private async reconnect(): Promise<void> {
@@ -248,6 +367,22 @@ export class SignalingClient extends Emitter<Events> {
         return this.emit("answer", { from: msg.from, sdp: msg.sdp });
       case "ice_candidate":
         return this.emit("candidate", { from: msg.from, candidate: msg.candidate });
+      case "lobby_waiting":
+        return this.emit("waiting", msg.room_id);
+      case "join_request":
+        return this.emit("join-request", {
+          request_id: msg.request_id,
+          display_name: msg.display_name,
+          device_id: msg.device_id,
+        });
+      case "join_request_cancelled":
+        return this.emit("join-request-cancelled", msg.request_id);
+      case "sfu_offer":
+        return this.emit("sfu-offer", msg.sdp);
+      case "sfu_answer":
+        return this.emit("sfu-answer", msg.sdp);
+      case "sfu_candidate":
+        return this.emit("sfu-candidate", { pc: msg.pc, candidate: msg.candidate });
       case "room_ended":
         this.leaving = true;
         this.shutdown();

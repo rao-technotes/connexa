@@ -2,11 +2,44 @@
 
 ## Topology
 
-Rooms of up to 3 use a full WebRTC mesh: every participant has one
-`RTCPeerConnection` to each other participant (A↔B, A↔C, B↔C). No media server
-is involved. Past about 4–5 participants, upload bandwidth grows linearly per
-sender, and that's when to evaluate an SFU. The protocol already carries
-`max_participants`, so clients adapt once the server allows larger rooms.
+| room | topology | media path | size |
+|---|---|---|---|
+| normal | **mesh** | every participant ↔ every other participant, P2P | up to 3 (`CONNEXA_MAX_PARTICIPANTS`) |
+| *Large meeting* | **SFU** | every participant ↔ the server's SFU | up to 25 (`CONNEXA_SFU_MAX_PARTICIPANTS`) |
+
+In a mesh each sender uploads one copy per peer, which is fine for three
+people. In an SFU room each participant uploads once, and the SFU
+(`crates/connexa-sfu`, written in Rust) forwards packets to everyone else
+without transcoding. Keyframe requests are passed back to the sender.
+Browsers cap camera video to 600 kbps and screen shares to 2.5 Mbps in SFU
+rooms, so a 25-person room stays within reach of a single server. All SFU
+media uses one UDP port (`CONNEXA_SFU_UDP_PORT`, default 3479). Behind 1:1 NAT
+(cloud VMs, Kubernetes), set `CONNEXA_SFU_PUBLIC_IP`.
+
+The SFU advertises IPv4 only and always acts as the DTLS client. Current
+browsers offer post-quantum key-exchange groups that webrtc-rs's DTLS server
+rejects, and its client handshake interoperates.
+
+## Multiple signaling nodes
+
+```text
+            load balancer (no sticky sessions)
+            /              |                      node 1          node 2          node 3      ← CONNEXA_NODE_SLOT 1..9
+           \______________ Redis pub/sub _____________/
+```
+
+A room lives on one node, and the first digit of its code is that node's
+slot. A client can connect to any node: when it joins a room owned elsewhere,
+its node forwards its messages over Redis (`connexa:node:<slot>`) and relays
+replies back. Nodes heartbeat every 3 s. If a room's node disappears, its
+clients get `room_ended { server_lost }`. If a client's node disappears, the
+owner treats the client as disconnected, and the reconnect grace applies.
+Rate limits are per node. On Kubernetes, the slot comes from the StatefulSet
+ordinal automatically.
+
+Media never crosses nodes. In SFU rooms, clients connect their media to the
+room owner's SFU, so every node running the SFU needs its own reachable UDP
+port.
 
 ## Connectivity
 
@@ -88,4 +121,13 @@ Android app for two-way media on a LAN.
 | `CONNEXA_TURN_SECRET` | – | coturn `static-auth-secret` |
 | `CONNEXA_TURN_USERNAME` / `CONNEXA_TURN_CREDENTIAL` | – | static TURN credentials |
 | `CONNEXA_TURN_TTL_SECS` | `21600` | TURN credential lifetime |
+| `CONNEXA_DATABASE_URL` | – | Postgres for devices, trust and audit log (in memory if unset) |
+| `CONNEXA_AUDIT_RETENTION_DAYS` | `90` | audit log retention |
+| `CONNEXA_REDIS_URL` | – | enables multi-node clustering |
+| `CONNEXA_NODE_SLOT` | from `HOSTNAME` | cluster slot 1–9 (StatefulSet `-N` → N+1) |
+| `CONNEXA_METRICS_TOKEN` | – | bearer token for `/metrics` (open if unset) |
+| `CONNEXA_SFU` | `false` | enable large (SFU) rooms |
+| `CONNEXA_SFU_UDP_PORT` | `3479` | SFU media port (UDP) |
+| `CONNEXA_SFU_PUBLIC_IP` | – | IP advertised by the SFU behind NAT |
+| `CONNEXA_SFU_MAX_PARTICIPANTS` | `25` | large room capacity |
 | `RUST_LOG` | `info` | log filter |

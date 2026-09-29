@@ -1,0 +1,15 @@
+# kubectl apply -k infrastructure/kubernetes
+# Create the secret first (see secrets.example.yaml) and set your domain in ingress.yaml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: connexa
+resources:
+  - namespace.yaml
+  - redis.yaml
+  - postgres.yaml
+  - signaling.yaml
+  - ingress.yaml
+images:
+  - name: connexa-signaling
+    newName: ghcr.io/rao-technotes/connexa-signaling
+    newTag: latest

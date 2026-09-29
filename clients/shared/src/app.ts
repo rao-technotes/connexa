@@ -2,9 +2,11 @@ import type { ControlPermission, NativeAgent, RemoteInput } from "./agent";
 import { RemoteControl } from "./control";
 import { FileTransfers, formatBytes, type Transfer } from "./files";
 import { escapeHtml, formatRoomCode, normalizeRoomCode } from "./format";
-import { PeerMesh, type ChatMessage, type MediaState, type RouteType, type StreamKind } from "./mesh";
-import type { ParticipantId, ParticipantInfo, RoomEndReason } from "./protocol";
-import { SignalingClient, SignalingError, type SessionInfo } from "./signaling";
+import { PeerMesh } from "./mesh";
+import type { ChatMessage, MediaSession, MediaState, RouteType, StreamKind } from "./session";
+import { SfuSession } from "./sfu";
+import type { ActivityEvent, DeviceSummary, ParticipantId, ParticipantInfo, RoomEndReason } from "./protocol";
+import { SignalingClient, SignalingError, type CreateOptions, type JoinRequest, type SessionInfo } from "./signaling";
 
 export interface AppOptions {
   /** WebSocket URL of the signaling server, e.g. wss://connexa.example/ws */
@@ -46,13 +48,37 @@ const ERROR_TEXT: Record<string, string> = {
   rate_limited: "Too many attempts. Wait a minute and try again.",
   server_busy: "The server is busy. Try again shortly.",
   connection_failed: "Could not reach the Connexa server.",
+  pin_required: "This session needs a PIN. Ask the host for it.",
+  wrong_pin: "That PIN is not right.",
+  invalid_pin: "PINs are 4 to 8 digits.",
+  join_denied: "The host did not let you in.",
+  unavailable: "Large meetings are not enabled on this server.",
 };
+
+const ACTIVITY_TEXT: Record<string, string> = {
+  room_created: "Started a session",
+  participant_joined: "Joined a session",
+  join_requested: "Asked to join a session",
+  admitted: "Admitted to a session",
+  denied: "Turned away from a session",
+  auto_admitted: "Admitted automatically (trusted device)",
+  pin_failed: "Wrong PIN entered",
+  room_ended: "Session ended",
+  control_granted: "Remote control granted",
+  control_revoked: "Remote control ended",
+  file_sent: "File sent",
+  file_received: "File received",
+  clipboard_shared: "Clipboard shared",
+};
+
+const OPTIONS_KEY = "connexa.createOptions";
 
 const END_TEXT: Record<RoomEndReason | "connection_lost", string> = {
   host_ended: "The host ended the session.",
   host_left: "The host left, so the session ended.",
   expired: "The session expired.",
   connection_lost: "Lost connection to the server.",
+  server_lost: "The server hosting this session went offline.",
 };
 
 const ICONS = {
@@ -68,6 +94,8 @@ const ICONS = {
   qr: '<rect x="4" y="4" width="6" height="6"/><rect x="14" y="4" width="6" height="6"/><rect x="4" y="14" width="6" height="6"/><path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 18h2M18 14h2"/>',
   expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   pointer: '<path d="m5 3 14 7-6 2-3 6Z"/>',
+  shield: '<path d="M12 3 5 6v5c0 4.5 3 8.5 7 10 4-1.5 7-5.5 7-10V6Z"/><path d="m9 12 2 2 4-4"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
 };
 
 const PERMISSION_TEXT: Record<ControlPermission, string> = {
@@ -104,7 +132,10 @@ export function mountApp(root: HTMLElement, options: AppOptions): AppHandle {
 
 class ConnexaApp {
   private signaling: SignalingClient | null = null;
-  private mesh: PeerMesh | null = null;
+  private mesh: MediaSession | null = null;
+  private trusted = new Set<string>();
+  private joinRequests = new Map<string, JoinRequest>();
+  private reported = new Set<string>();
   private session: SessionInfo | null = null;
   private members = new Map<ParticipantId, Member>();
   private tiles = new Map<string, HTMLElement>();
@@ -143,7 +174,8 @@ class ConnexaApp {
 
   // ----- home ----------------------------------------------------------
 
-  private renderHome(prefill = "", error = ""): void {
+  private renderHome(prefill = "", error = "", needPin = false): void {
+    const saved = readCreateOptions();
     this.root.innerHTML = `
       <main class="home">
         <div class="home-card">
@@ -154,20 +186,32 @@ class ConnexaApp {
             <input id="name" maxlength="32" autocomplete="nickname" placeholder="Optional">
           </label>
           <button id="create" class="btn primary wide">Start session</button>
+          <details class="options" id="create-options" ${saved.lobby || saved.large ? "open" : ""}>
+            <summary>Meeting options</summary>
+            <label class="check"><input type="checkbox" id="opt-lobby" ${saved.lobby ? "checked" : ""}> Ask me before people join</label>
+            <label class="field"><span>PIN (optional, 4 to 8 digits)</span>
+              <input id="opt-pin" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="No PIN"></label>
+            <label class="check"><input type="checkbox" id="opt-large" ${saved.large ? "checked" : ""}> Large meeting (more than 3 people)</label>
+          </details>
           <div class="or"><span>or join one</span></div>
-          <form id="join-form" class="join-row">
-            <input id="code" inputmode="numeric" autocomplete="off" placeholder="847 291 653" aria-label="Session code">
-            <button class="btn">Join</button>
+          <form id="join-form" class="join-form">
+            <div class="join-row">
+              <input id="code" inputmode="numeric" autocomplete="off" placeholder="847 291 653" aria-label="Session code">
+              <button class="btn">Join</button>
+            </div>
+            <label class="field" id="join-pin-row" ${needPin ? "" : "hidden"}>
+              <span>Session PIN</span>
+              <input id="join-pin" inputmode="numeric" maxlength="8" autocomplete="off">
+            </label>
           </form>
           <p id="home-error" class="error" role="alert">${escapeHtml(error)}</p>
           ${this.options.note ? `<p class="note">${escapeHtml(this.options.note)}</p>` : ""}
-          ${
-            this.options.homeLinks?.length
-              ? `<div class="home-links">${this.options.homeLinks
-                  .map((l, i) => `<button type="button" class="link" data-link="${i}">${escapeHtml(l.label)}</button>`)
-                  .join("")}</div>`
-              : ""
-          }
+          <div class="home-links">
+            <button type="button" class="link" id="my-device">This device</button>
+            ${(this.options.homeLinks ?? [])
+              .map((l, i) => `<button type="button" class="link" data-link="${i}">${escapeHtml(l.label)}</button>`)
+              .join("")}
+          </div>
         </div>
       </main>`;
     this.root.querySelectorAll<HTMLButtonElement>("[data-link]").forEach((b) =>
@@ -182,13 +226,15 @@ class ConnexaApp {
       code.value = formatRoomCode(digits);
     });
     this.$("#create").addEventListener("click", () => void this.begin(null));
+    this.$("#my-device").addEventListener("click", () => void this.renderDevicePage());
     this.$("#join-form").addEventListener("submit", (ev) => {
       ev.preventDefault();
       const normalized = normalizeRoomCode(code.value);
       if (!normalized) return this.showHomeError(ERROR_TEXT.invalid_room_code);
       void this.begin(normalized);
     });
-    (prefill ? name : code).focus();
+    if (needPin) this.$<HTMLInputElement>("#join-pin").focus();
+    else (prefill ? name : code).focus();
   }
 
   private showHomeError(text: string): void {
@@ -203,19 +249,28 @@ class ConnexaApp {
     const nameInput = this.root.querySelector<HTMLInputElement>("#name");
     const name = (nameInput?.value ?? this.options.displayName ?? readName()).trim();
     if (nameInput) saveName(name);
+    const pin = this.root.querySelector<HTMLInputElement>("#join-pin")?.value.trim() || undefined;
+    const options: CreateOptions = {
+      lobby: this.root.querySelector<HTMLInputElement>("#opt-lobby")?.checked ?? false,
+      large: this.root.querySelector<HTMLInputElement>("#opt-large")?.checked ?? false,
+      pin: this.root.querySelector<HTMLInputElement>("#opt-pin")?.value.trim() || undefined,
+    };
+    if (!code) saveCreateOptions(options);
     this.root.querySelectorAll<HTMLButtonElement>(".home button").forEach((b) => (b.disabled = true));
     this.showHomeError(code ? "Joining…" : "Creating session…");
 
-    const signaling = new SignalingClient(this.options.signalingUrl);
+    const signaling = new SignalingClient(this.options.signalingUrl, name);
+    signaling.on("waiting", () => this.renderWaiting(signaling));
     try {
       const { session, participants } = code
-        ? await signaling.joinRoom(code, name)
-        : await signaling.createRoom(name);
+        ? await signaling.joinRoom(code, name, pin)
+        : await signaling.createRoom(name, options);
       this.enterSession(signaling, session, participants, name);
     } catch (err) {
       signaling.leave();
       const key = err instanceof SignalingError ? err.code : "connection_failed";
-      this.renderHome(code ?? "", ERROR_TEXT[key] ?? (err as Error).message);
+      if (key === "cancelled") this.renderHome(code ?? "");
+      else this.renderHome(code ?? "", ERROR_TEXT[key] ?? (err as Error).message, key === "pin_required" || key === "wrong_pin");
     } finally {
       this.busy = false;
     }
@@ -231,14 +286,25 @@ class ConnexaApp {
   ): void {
     this.signaling = signaling;
     this.session = session;
-    const mesh = new PeerMesh(signaling, session.selfId, session.iceServers);
+    const mesh: MediaSession =
+      session.topology === "sfu"
+        ? new SfuSession(signaling, session.selfId, session.iceServers)
+        : new PeerMesh(signaling, session.selfId, session.iceServers);
     this.mesh = mesh;
+    this.trusted.clear();
+    this.joinRequests.clear();
+    this.reported.clear();
     this.members.clear();
     this.tiles.clear();
     const isHost = session.hostId === session.selfId;
     const idle: MediaState = { mic: false, cam: false, screen: false, control: false };
     const files = new FileTransfers(mesh);
-    const control = new RemoteControl(mesh, this.options.agent, (id) => this.nameOf(id));
+    const control = new RemoteControl(
+      mesh,
+      this.options.agent,
+      (id) => this.nameOf(id),
+      (kind, subject) => signaling.reportEvent(kind, subject),
+    );
     this.files = files;
     this.control = control;
     this.transferEls.clear();
@@ -283,6 +349,24 @@ class ConnexaApp {
       this.root.querySelector("#reconnect-banner")?.toggleAttribute("hidden", status !== "reconnecting");
     });
     signaling.on("ended", (reason) => this.exitSession(END_TEXT[reason]));
+    signaling.on("join-request", (req) => {
+      this.joinRequests.set(req.request_id, req);
+      this.toast(`${req.display_name} is waiting to join`);
+      this.renderLobby();
+    });
+    signaling.on("join-request-cancelled", (id) => {
+      this.joinRequests.delete(id);
+      this.renderLobby();
+    });
+    if (signaling.deviceId) {
+      signaling
+        .trustedDevices()
+        .then((list) => {
+          this.trusted = new Set(list.map((d) => d.device_id));
+          this.renderMembers();
+        })
+        .catch(() => {});
+    }
     signaling.on("error", ({ message }) => this.toast(message));
 
     mesh.on("peer-state", ({ id, state, route }) => {
@@ -297,7 +381,13 @@ class ConnexaApp {
       if (m) m.media = state;
       this.renderMembers();
     });
-    files.on("update", (t) => this.renderTransfer(t));
+    files.on("update", (t) => {
+      this.renderTransfer(t);
+      if (t.state === "done" && !this.reported.has(t.id)) {
+        this.reported.add(t.id);
+        signaling.reportEvent(t.direction === "in" ? "file_received" : "file_sent", t.peerId);
+      }
+    });
     files.on("received", ({ transfer, blob }) => void this.saveFile(blob, transfer.name));
     control.on("request", (req) => {
       this.controlRequests.push(req);
@@ -338,6 +428,11 @@ class ConnexaApp {
           <div class="code-block">
             <span class="label">Session code</span>
             <span class="code" id="room-code">${formatRoomCode(code)}</span>
+            <span class="room-badges">
+              ${this.session!.topology === "sfu" ? '<span class="tag">Large meeting</span>' : ""}
+              ${this.session!.security.pin ? `<span class="tag">${icon("lock")}PIN</span>` : ""}
+              ${this.session!.security.lobby ? '<span class="tag">Lobby</span>' : ""}
+            </span>
           </div>
           <div class="top-actions">
             <button class="btn ghost small" id="copy-code" title="Copy code">${icon("copy")}<span>Code</span></button>
@@ -353,12 +448,16 @@ class ConnexaApp {
         <div class="workspace">
           <section class="stage" id="stage" aria-label="Video"></section>
           <aside class="side" id="side">
+            <section class="panel lobby" id="lobby-panel" hidden>
+              <h2>Waiting to join</h2>
+              <ul class="members" id="lobby-list"></ul>
+            </section>
             <section class="panel">
               <h2>Participants <span id="member-count" class="muted"></span></h2>
               <ul class="members" id="members"></ul>
             </section>
             <section class="panel chat">
-              <h2>Chat &amp; files <span class="muted small">peer-to-peer</span></h2>
+              <h2>Chat &amp; files <span class="muted small">${this.session!.topology === "sfu" ? "relayed by the server" : "peer-to-peer"}</span></h2>
               <ol class="messages" id="messages" aria-live="polite"></ol>
               <form class="chat-form" id="chat-form">
                 <button type="button" class="icon-btn" id="send-file" title="Send files">${icon("file")}</button>
@@ -428,7 +527,7 @@ class ConnexaApp {
     this.$("#stop-control").addEventListener("click", () => void this.control?.revokeAll());
     this.$<HTMLDialogElement>("#control-dialog").addEventListener("close", () => this.answerControlRequest());
     this.root.querySelector("#show-qr")?.addEventListener("click", () => void this.showQr(code));
-    if (!navigator.mediaDevices?.getDisplayMedia) this.$("#ctl-screen").hidden = true;
+    if (!navigator.mediaDevices?.getDisplayMedia && !this.options.agent?.screen) this.$("#ctl-screen").hidden = true;
     this.$("#chat-form").addEventListener("submit", (ev) => {
       ev.preventDefault();
       const input = this.$<HTMLInputElement>("#chat-input");
@@ -449,7 +548,7 @@ class ConnexaApp {
     const mesh = this.mesh;
     if (!mesh) return;
     const state = mesh.mediaState;
-    if (!navigator.mediaDevices) {
+    if (!navigator.mediaDevices && !(what === "screen" && this.options.agent?.screen)) {
       // Browsers hide media devices on plain-http pages (e.g. a LAN invite link).
       return this.toast("Camera, microphone and screen sharing need HTTPS here. You can still watch, chat and send files, or use the Connexa app.");
     }
@@ -457,7 +556,9 @@ class ConnexaApp {
       if (what === "mic") await mesh.setMic(!state.mic);
       else if (what === "cam") await mesh.setCamera(!state.cam);
       else if (state.screen) mesh.stopScreenShare();
-      else await mesh.startScreenShare();
+      else if (!navigator.mediaDevices?.getDisplayMedia && this.options.agent?.screen) {
+        await mesh.startNativeScreen(this.options.agent.screen);
+      } else await mesh.startScreenShare();
     } catch (err) {
       const name = (err as DOMException)?.name;
       if (name === "NotAllowedError") {
@@ -480,6 +581,159 @@ class ConnexaApp {
     this.teardown();
     this.renderHome("", message);
     this.options.onSessionEnd?.();
+  }
+
+  // ----- lobby, trust, device page -----------------------------------------
+
+  private renderWaiting(signaling: SignalingClient): void {
+    this.root.innerHTML = `
+      <main class="home">
+        <div class="home-card">
+          <h1 class="brand">Waiting to join</h1>
+          <p class="tagline">The host has been told you are here. You will join as soon as they let you in.</p>
+          <div class="spinner" aria-hidden="true"></div>
+          <button id="cancel-wait" class="btn wide">Cancel</button>
+        </div>
+      </main>`;
+    this.$("#cancel-wait").addEventListener("click", () => signaling.leave());
+  }
+
+  private renderLobby(): void {
+    const panel = this.root.querySelector<HTMLElement>("#lobby-panel");
+    const list = this.root.querySelector("#lobby-list");
+    if (!panel || !list) return;
+    panel.hidden = this.joinRequests.size === 0;
+    const canTrust = !!this.signaling?.deviceId;
+    list.innerHTML = [...this.joinRequests.values()]
+      .map(
+        (r) => `<li>
+          <span class="avatar small">${escapeHtml(initial(r.display_name))}</span>
+          <span class="member-name">${escapeHtml(r.display_name)}${verifiedBadge(r.device_id)}</span>
+          <span class="lobby-actions">
+            <button class="btn small primary" data-admit="${escapeHtml(r.request_id)}">Admit</button>
+            <button class="btn small" data-deny="${escapeHtml(r.request_id)}">Deny</button>
+            ${
+              canTrust && r.device_id
+                ? `<button class="btn small ghost" data-always="${escapeHtml(r.request_id)}" title="Trust this device: it will join your sessions without waiting">Always</button>`
+                : ""
+            }
+          </span>
+        </li>`,
+      )
+      .join("");
+    const answer = (id: string, admit: boolean) => {
+      this.joinRequests.delete(id);
+      if (admit) this.signaling?.admit(id);
+      else this.signaling?.deny(id);
+      this.renderLobby();
+    };
+    list.querySelectorAll<HTMLButtonElement>("[data-admit]").forEach((b) =>
+      b.addEventListener("click", () => answer(b.dataset.admit!, true)),
+    );
+    list.querySelectorAll<HTMLButtonElement>("[data-deny]").forEach((b) =>
+      b.addEventListener("click", () => answer(b.dataset.deny!, false)),
+    );
+    list.querySelectorAll<HTMLButtonElement>("[data-always]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const req = this.joinRequests.get(b.dataset.always!);
+        if (!req?.device_id) return;
+        answer(req.request_id, true);
+        await this.setTrust(req.device_id, true);
+      }),
+    );
+  }
+
+  private trustButton(m: Member): string {
+    const device = m.info.device_id;
+    if (m.state === "self" || !device || !this.signaling?.deviceId) return "";
+    const trusted = this.trusted.has(device);
+    return `<button class="trust-btn ${trusted ? "on" : ""}" data-trust="${escapeHtml(device)}"
+      title="${trusted ? "Trusted: joins your sessions without waiting. Click to stop trusting." : "Trust this device so it can join your sessions without waiting"}">${trusted ? "Trusted" : "Trust"}</button>`;
+  }
+
+  private async toggleTrust(device: string): Promise<void> {
+    await this.setTrust(device, !this.trusted.has(device));
+  }
+
+  private async setTrust(device: string, trusted: boolean): Promise<void> {
+    try {
+      const list = await this.signaling!.trustDevice(device, trusted);
+      this.trusted = new Set(list.map((d) => d.device_id));
+      this.toast(trusted ? "Device trusted" : "Device no longer trusted");
+      this.renderMembers();
+    } catch (err) {
+      this.toast(`Could not update trust: ${(err as Error).message}`);
+    }
+  }
+
+  /** Device ID, trusted devices and recent activity for this device. */
+  private async renderDevicePage(): Promise<void> {
+    const back = () => {
+      signaling.leave();
+      this.renderHome();
+    };
+    this.root.innerHTML = `
+      <main class="home">
+        <div class="home-card device-card">
+          <h1 class="brand">This device</h1>
+          <p class="tagline">A key stored only on this device proves who you are. Trusted devices can join your sessions without waiting for approval.</p>
+          <div class="device-id" id="dev-id">Connecting…</div>
+          <h2>Trusted devices</h2>
+          <ul class="plain-list" id="trusted-list"><li class="muted">Loading…</li></ul>
+          <h2>Recent activity</h2>
+          <ol class="plain-list" id="activity-list"><li class="muted">Loading…</li></ol>
+          <div class="home-links"><button type="button" class="link" id="dev-back">Back</button></div>
+        </div>
+      </main>`;
+    const signaling = new SignalingClient(this.options.signalingUrl, readName());
+    this.$("#dev-back").addEventListener("click", back);
+    try {
+      await signaling.connect();
+    } catch {
+      this.$("#dev-id").textContent = "Could not reach the Connexa server.";
+      return;
+    }
+    const id = signaling.deviceId;
+    if (!id) {
+      this.$("#dev-id").textContent = "Device identity is not available in this browser.";
+      return;
+    }
+    this.$("#dev-id").innerHTML = `${icon("shield")}<code>${escapeHtml(id)}</code>`;
+
+    const renderTrusted = (devices: DeviceSummary[]) => {
+      const list = this.root.querySelector("#trusted-list");
+      if (!list) return;
+      list.innerHTML = devices.length
+        ? devices
+            .map(
+              (d) => `<li><span><b>${escapeHtml(d.name)}</b> <span class="muted small">${escapeHtml(d.platform)} · ${escapeHtml(d.device_id)}</span></span>
+                <button class="btn small" data-untrust="${escapeHtml(d.device_id)}">Remove</button></li>`,
+            )
+            .join("")
+        : '<li class="muted">None yet. Trust a device from the participant list during a session.</li>';
+      list.querySelectorAll<HTMLButtonElement>("[data-untrust]").forEach((b) =>
+        b.addEventListener("click", async () => renderTrusted(await signaling.trustDevice(b.dataset.untrust!, false))),
+      );
+    };
+    const renderActivity = (events: ActivityEvent[]) => {
+      const list = this.root.querySelector("#activity-list");
+      if (!list) return;
+      list.innerHTML = events.length
+        ? events
+            .map((e) => {
+              const who = [e.actor, e.subject].filter((x) => x).map((x) => escapeHtml(x!)).join(" → ");
+              return `<li><span>${escapeHtml(ACTIVITY_TEXT[e.kind] ?? e.kind)}${who ? ` <span class="muted small">${who}</span>` : ""}</span>
+                <time class="muted small">${formatWhen(e.at)}</time></li>`;
+            })
+            .join("")
+        : '<li class="muted">No activity yet.</li>';
+    };
+    try {
+      renderTrusted(await signaling.trustedDevices());
+      renderActivity(await signaling.activity());
+    } catch (err) {
+      this.root.querySelector("#activity-list")!.innerHTML = `<li class="muted">${escapeHtml((err as Error).message)}</li>`;
+    }
   }
 
   private teardown(): void {
@@ -590,6 +844,7 @@ class ConnexaApp {
     }
     if (!text.trim()) return this.toast("Your clipboard has no text.");
     this.control.shareClipboard(text);
+    this.signaling?.reportEvent("clipboard_shared");
     this.appendClipboard(this.session!.selfId, text, false);
   }
 
@@ -821,7 +1076,8 @@ class ConnexaApp {
         ].join("");
         return `<li>
           <span class="avatar small">${escapeHtml(initial(m.info.display_name))}</span>
-          <span class="member-name">${escapeHtml(m.info.display_name)} ${flags}</span>
+          <span class="member-name">${escapeHtml(m.info.display_name)} ${flags}${verifiedBadge(m.info.device_id)}</span>
+          ${this.trustButton(m)}
           <span class="member-media">
             <i class="${m.media.mic ? "live" : ""}" title="Microphone">${icon("mic")}</i>
             <i class="${m.media.cam ? "live" : ""}" title="Camera">${icon("cam")}</i>
@@ -831,6 +1087,9 @@ class ConnexaApp {
         </li>`;
       })
       .join("");
+    list.querySelectorAll<HTMLButtonElement>("[data-trust]").forEach((b) =>
+      b.addEventListener("click", () => void this.toggleTrust(b.dataset.trust!)),
+    );
     const count = this.root.querySelector("#member-count");
     if (count) count.textContent = `${this.members.size}/${this.session.maxParticipants}`;
     this.tilesChanged();
@@ -920,12 +1179,30 @@ class ConnexaApp {
   }
 
   /** Screen shares get the big spot; everything else shares the grid. */
+  /**
+   * While someone presents, the first screen share takes the main area and
+   * every other tile moves into a scrollable filmstrip beside it.
+   */
   private layoutStage(): void {
     const stage = this.root.querySelector<HTMLElement>("#stage");
     if (!stage) return;
-    const hasScreen = [...this.tiles.values()].some((t) => t.dataset.kind === "screen");
-    stage.classList.toggle("presenting", hasScreen);
-    stage.dataset.count = String(this.tiles.size);
+    const tiles = [...this.tiles.values()];
+    const main = tiles.find((t) => t.dataset.kind === "screen");
+    stage.classList.toggle("presenting", !!main);
+    stage.dataset.count = String(tiles.length);
+    let strip = stage.querySelector<HTMLElement>(":scope > .filmstrip");
+    if (main) {
+      if (!strip) {
+        strip = document.createElement("div");
+        strip.className = "filmstrip";
+        stage.appendChild(strip);
+      }
+      if (main.parentElement !== stage) move(main, () => stage.insertBefore(main, stage.firstChild));
+      for (const t of tiles) if (t !== main && t.parentElement !== strip) move(t, () => strip!.appendChild(t));
+    } else if (strip) {
+      for (const t of tiles) if (t.parentElement === strip) move(t, () => stage.appendChild(t));
+      strip.remove();
+    }
   }
 
   private appendChat(msg: ChatMessage): void {
@@ -981,7 +1258,44 @@ function initial(name: string): string {
   return (name.trim()[0] ?? "?").toUpperCase();
 }
 
+/** Move a tile in the DOM; browsers pause a <video> that leaves the document, so resume it. */
+function move(tile: HTMLElement, place: () => void): void {
+  place();
+  void tile.querySelector("video")?.play().catch(() => {});
+}
+
+function verifiedBadge(deviceId: string | undefined): string {
+  return deviceId
+    ? `<i class="verified" title="Verified device ${escapeHtml(deviceId)}">${icon("shield")}</i>`
+    : "";
+}
+
+function readCreateOptions(): CreateOptions {
+  try {
+    return JSON.parse(localStorage.getItem(OPTIONS_KEY) ?? "{}") as CreateOptions;
+  } catch {
+    return {};
+  }
+}
+
+function saveCreateOptions(options: CreateOptions): void {
+  try {
+    // Never persist the PIN.
+    localStorage.setItem(OPTIONS_KEY, JSON.stringify({ lobby: options.lobby, large: options.large }));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function formatWhen(unix: number): string {
+  const d = new Date(unix * 1000);
+  return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 function connectionBadge(state: RTCPeerConnectionState | "self", route: RouteType): string {
+  if (state === "connected" && route === "sfu") {
+    return '<span class="conn sfu" title="Media flows through the server (large meeting)">SFU</span>';
+  }
   if (state === "connected") {
     return route === "relay"
       ? '<span class="conn relay" title="Connected through a TURN relay">Relay</span>'

@@ -26,6 +26,8 @@ export interface NativeAgent {
   platform: "windows" | "android";
   /** Can inject mouse/keyboard input (remote control host). */
   canControl: boolean;
+  /** Native screen capture, where the web view has no getDisplayMedia (Android). */
+  screen?: NativeScreenSource;
   monitors?(): Promise<Monitor[]>;
   /**
    * Grant control to a peer. Implementations must show a native confirmation
@@ -40,6 +42,29 @@ export interface NativeAgent {
   /** Save a received file (platforms where <a download> doesn't work). */
   saveFile?(blob: Blob, name: string): Promise<void>;
 }
+
+/**
+ * A screen captured natively and sent over its own peer connection to each
+ * viewer ("side link"). Offers, answers and ICE travel as peer messages.
+ */
+export interface NativeScreenSource {
+  /** Ask the OS for capture permission and start capturing. Resolves false if declined. */
+  start(iceServers: RTCIceServer[]): Promise<boolean>;
+  /** Create a side link to a viewer; the offer arrives as an "offer" event. */
+  offer(peerId: string): void;
+  answer(peerId: string, sdp: string): void;
+  candidate(peerId: string, candidate: RTCIceCandidateInit): void;
+  close(peerId: string): void;
+  stop(): void;
+  /** Stream id the viewers will see, announced as a "screen" stream. */
+  readonly streamId: string;
+  onEvent: ((e: NativeScreenEvent) => void) | null;
+}
+
+export type NativeScreenEvent =
+  | { type: "offer"; peerId: string; sdp: string }
+  | { type: "ice"; peerId: string; candidate: RTCIceCandidateInit }
+  | { type: "stopped" };
 
 /** Validate an input event coming from an untrusted peer. */
 export function parseRemoteInput(raw: unknown): RemoteInput | null {

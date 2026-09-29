@@ -58,6 +58,9 @@ fn create(hub: &Hub) -> (Client, String, String, String) {
         hub,
         ClientMessage::CreateRoom {
             display_name: Some("Alice".into()),
+            pin: None,
+            lobby: false,
+            large: false,
         },
     );
     match host.recv() {
@@ -82,6 +85,7 @@ fn join(hub: &Hub, code: &str, name: &str) -> (Client, String) {
         ClientMessage::JoinRoom {
             room_id: code.into(),
             display_name: Some(name.into()),
+            pin: None,
         },
     );
     match c.recv() {
@@ -111,6 +115,7 @@ fn create_and_join_announces_presence() {
         ClientMessage::JoinRoom {
             room_id: spaced,
             display_name: Some("Bob".into()),
+            pin: None,
         },
     );
     let guest_id = match guest.recv() {
@@ -137,12 +142,10 @@ fn create_and_join_announces_presence() {
         }
         other => panic!("unexpected {other:?}"),
     }
+    let stats = hub.stats();
     assert_eq!(
-        hub.stats(),
-        HubStats {
-            rooms: 1,
-            participants: 2
-        }
+        (stats.rooms, stats.participants, stats.connections),
+        (1, 2, 2)
     );
 }
 
@@ -155,6 +158,7 @@ fn join_errors() {
         ClientMessage::JoinRoom {
             room_id: "12345".into(),
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut c, ErrorCode::InvalidRoomCode);
@@ -163,6 +167,7 @@ fn join_errors() {
         ClientMessage::JoinRoom {
             room_id: "123456789".into(),
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut c, ErrorCode::RoomNotFound);
@@ -182,6 +187,7 @@ fn room_capacity_is_enforced() {
         ClientMessage::JoinRoom {
             room_id: code,
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut c, ErrorCode::RoomFull);
@@ -320,6 +326,7 @@ fn only_host_can_end_room() {
         ClientMessage::JoinRoom {
             room_id: code,
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut c, ErrorCode::RoomNotFound);
@@ -329,7 +336,15 @@ fn only_host_can_end_room() {
 fn cannot_create_twice() {
     let hub = hub();
     let (mut a, ..) = create(&hub);
-    a.send(&hub, ClientMessage::CreateRoom { display_name: None });
+    a.send(
+        &hub,
+        ClientMessage::CreateRoom {
+            display_name: None,
+            pin: None,
+            lobby: false,
+            large: false,
+        },
+    );
     expect_error(&mut a, ErrorCode::AlreadyInRoom);
 }
 
@@ -455,6 +470,7 @@ fn join_attempts_are_rate_limited_per_ip() {
             ClientMessage::JoinRoom {
                 room_id: "123456789".into(),
                 display_name: None,
+                pin: None,
             },
         );
         expect_error(&mut guesser, ErrorCode::RoomNotFound);
@@ -464,6 +480,7 @@ fn join_attempts_are_rate_limited_per_ip() {
         ClientMessage::JoinRoom {
             room_id: "123456789".into(),
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut guesser, ErrorCode::RateLimited);
@@ -474,7 +491,434 @@ fn join_attempts_are_rate_limited_per_ip() {
         ClientMessage::JoinRoom {
             room_id: "123456789".into(),
             display_name: None,
+            pin: None,
         },
     );
     expect_error(&mut other, ErrorCode::RoomNotFound);
+}
+
+// ----- lobby, PIN, devices, audit, SFU ---------------------------------------------
+
+fn create_msg(pin: Option<&str>, lobby: bool, large: bool) -> ClientMessage {
+    ClientMessage::CreateRoom {
+        display_name: Some("Alice".into()),
+        pin: pin.map(String::from),
+        lobby,
+        large,
+    }
+}
+
+fn join_msg(code: &str, name: &str, pin: Option<&str>) -> ClientMessage {
+    ClientMessage::JoinRoom {
+        room_id: code.into(),
+        display_name: Some(name.into()),
+        pin: pin.map(String::from),
+    }
+}
+
+fn created(c: &mut Client) -> (String, String) {
+    match c.recv() {
+        ServerMessage::RoomCreated {
+            room_id,
+            participant_id,
+            ..
+        } => (room_id, participant_id),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn events_hub(config: HubConfig) -> (Hub, mpsc::UnboundedReceiver<HubEvent>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (hub_with(config).with_events(tx), rx)
+}
+
+fn drain(rx: &mut mpsc::UnboundedReceiver<HubEvent>) -> Vec<HubEvent> {
+    let mut v = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        v.push(e);
+    }
+    v
+}
+
+/// Run the device key proof for a client; returns its device id.
+fn verify_device(hub: &Hub, c: &mut Client, seed: u8) -> String {
+    use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::EncodePublicKey;
+    let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let public = b64(key.verifying_key().to_public_key_der().unwrap().as_bytes());
+    c.send(
+        hub,
+        ClientMessage::DeviceHello {
+            public_key: public,
+            name: Some(format!("device {seed}")),
+            platform: Some("test".into()),
+        },
+    );
+    let nonce = match c.recv() {
+        ServerMessage::DeviceChallenge { nonce } => nonce,
+        other => panic!("unexpected {other:?}"),
+    };
+    let sig: Signature = key.sign(format!("connexa-device-auth:{nonce}").as_bytes());
+    c.send(
+        hub,
+        ClientMessage::DeviceProof {
+            signature: b64(&sig.to_bytes()),
+        },
+    );
+    match c.recv() {
+        ServerMessage::DeviceVerified { device_id } => device_id,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn lobby_joiners_wait_until_admitted() {
+    let hub = hub();
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, true, false));
+    let (code, _) = created(&mut host);
+
+    let mut bob = client(&hub);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    assert_eq!(
+        bob.recv(),
+        ServerMessage::LobbyWaiting {
+            room_id: code.clone()
+        }
+    );
+    let request_id = match host.recv() {
+        ServerMessage::JoinRequest {
+            request_id,
+            display_name,
+            ..
+        } => {
+            assert_eq!(display_name, "Bob");
+            request_id
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+    // Waiting does not count as being in the room.
+    assert_eq!(hub.stats().participants, 1);
+    bob.send(
+        &hub,
+        ClientMessage::SdpOffer {
+            target: "x".into(),
+            sdp: String::new(),
+        },
+    );
+    expect_error(&mut bob, ErrorCode::NotInRoom);
+
+    host.send(
+        &hub,
+        ClientMessage::Admit {
+            request_id: request_id.clone(),
+        },
+    );
+    assert!(matches!(
+        host.recv(),
+        ServerMessage::ParticipantJoined { .. }
+    ));
+    assert!(matches!(bob.recv(), ServerMessage::RoomJoined { .. }));
+    assert_eq!(hub.stats().participants, 2);
+
+    // A stale request cannot be answered twice.
+    host.send(&hub, ClientMessage::Admit { request_id });
+    expect_error(&mut host, ErrorCode::TargetNotFound);
+}
+
+#[test]
+fn lobby_deny_and_cancel() {
+    let hub = hub();
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, true, false));
+    let (code, _) = created(&mut host);
+
+    let mut bob = client(&hub);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    bob.recv();
+    let ServerMessage::JoinRequest { request_id, .. } = host.recv() else {
+        panic!()
+    };
+    host.send(&hub, ClientMessage::Deny { request_id });
+    expect_error(&mut bob, ErrorCode::JoinDenied);
+    // Bob is free to try again (and wait again).
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    assert!(matches!(bob.recv(), ServerMessage::LobbyWaiting { .. }));
+    let ServerMessage::JoinRequest { request_id, .. } = host.recv() else {
+        panic!()
+    };
+
+    // Disconnecting while waiting cancels the request for the host.
+    hub.disconnect(bob.conn);
+    assert_eq!(
+        host.recv(),
+        ServerMessage::JoinRequestCancelled { request_id }
+    );
+    assert_eq!(hub.stats().waiting, 0);
+}
+
+#[test]
+fn only_the_host_admits() {
+    let hub = hub();
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, true, false));
+    let (code, _) = created(&mut host);
+    let mut bob = client(&hub);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    bob.recv();
+    let ServerMessage::JoinRequest { request_id, .. } = host.recv() else {
+        panic!()
+    };
+    host.send(&hub, ClientMessage::Admit { request_id });
+    host.recv();
+    bob.recv();
+
+    let mut carol = client(&hub);
+    carol.send(&hub, join_msg(&code, "Carol", None));
+    carol.recv();
+    let ServerMessage::JoinRequest { request_id, .. } = host.recv() else {
+        panic!()
+    };
+    bob.send(&hub, ClientMessage::Admit { request_id });
+    expect_error(&mut bob, ErrorCode::NotHost);
+}
+
+#[test]
+fn ending_a_room_releases_lobby_waiters() {
+    let hub = hub();
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, true, false));
+    let (code, _) = created(&mut host);
+    let mut bob = client(&hub);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    bob.recv();
+    host.send(&hub, ClientMessage::EndRoom);
+    assert_eq!(
+        bob.recv(),
+        ServerMessage::RoomEnded {
+            reason: RoomEndReason::HostEnded
+        }
+    );
+    // Bob can create his own room afterwards.
+    bob.send(&hub, create_msg(None, false, false));
+    created(&mut bob);
+}
+
+#[test]
+fn pins_are_checked_and_locked_out() {
+    let hub = hub_with(HubConfig {
+        max_wrong_pins: 3,
+        ..Default::default()
+    });
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(Some("12"), false, false));
+    expect_error(&mut host, ErrorCode::InvalidPin);
+    host.send(&hub, create_msg(Some("4321"), false, false));
+    let code = match host.recv() {
+        ServerMessage::RoomCreated {
+            room_id, security, ..
+        } => {
+            assert!(security.pin && !security.lobby);
+            room_id
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+
+    let mut bob = client_from(&hub, "10.0.0.2");
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    expect_error(&mut bob, ErrorCode::PinRequired);
+    for _ in 0..3 {
+        bob.send(&hub, join_msg(&code, "Bob", Some("0000")));
+        expect_error(&mut bob, ErrorCode::WrongPin);
+    }
+    // Locked: even the right PIN is refused for now.
+    bob.send(&hub, join_msg(&code, "Bob", Some("4321")));
+    expect_error(&mut bob, ErrorCode::RateLimited);
+    // The lockout lifts after it expires.
+    hub.sweep(Instant::now() + Duration::from_secs(301));
+    bob.send(&hub, join_msg(&code, "Bob", Some("4321")));
+    assert!(matches!(bob.recv(), ServerMessage::RoomJoined { .. }));
+}
+
+#[test]
+fn device_proofs_attach_verified_ids() {
+    let (hub, mut events) = events_hub(HubConfig::default());
+    let mut host = client(&hub);
+    let host_dev = verify_device(&hub, &mut host, 1);
+    assert!(matches!(
+        drain(&mut events).as_slice(),
+        [HubEvent::DeviceSeen { .. }]
+    ));
+    host.send(&hub, create_msg(None, false, false));
+    let (code, _) = created(&mut host);
+
+    let mut bob = client(&hub);
+    let bob_dev = verify_device(&hub, &mut bob, 2);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    match bob.recv() {
+        ServerMessage::RoomJoined { participants, .. } => {
+            assert_eq!(
+                participants[0].device_id.as_deref(),
+                Some(host_dev.as_str())
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match host.recv() {
+        ServerMessage::ParticipantJoined { participant } => {
+            assert_eq!(participant.device_id.as_deref(), Some(bob_dev.as_str()));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let kinds: Vec<String> = drain(&mut events)
+        .into_iter()
+        .filter_map(|e| match e {
+            HubEvent::Audit(a) => Some(a.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["room_created", "participant_joined"]);
+}
+
+#[test]
+fn bad_device_proofs_are_rejected() {
+    let hub = hub();
+    let mut c = client(&hub);
+    c.send(
+        &hub,
+        ClientMessage::DeviceProof {
+            signature: "AAAA".into(),
+        },
+    );
+    expect_error(&mut c, ErrorCode::NotVerified);
+    c.send(
+        &hub,
+        ClientMessage::DeviceHello {
+            public_key: "bm90IGEga2V5".into(),
+            name: None,
+            platform: None,
+        },
+    );
+    expect_error(&mut c, ErrorCode::NotVerified);
+}
+
+#[test]
+fn trusted_devices_skip_the_lobby() {
+    let hub = hub();
+    let mut host = client(&hub);
+    let host_dev = verify_device(&hub, &mut host, 1);
+    host.send(&hub, create_msg(None, true, false));
+    let (code, _) = created(&mut host);
+
+    let mut bob = client(&hub);
+    let bob_dev = verify_device(&hub, &mut bob, 2);
+    hub.load_trust(&host_dev, [bob_dev.clone()]);
+    bob.send(&hub, join_msg(&code, "Bob", None));
+    assert!(matches!(bob.recv(), ServerMessage::RoomJoined { .. }));
+
+    // An untrusted device still waits.
+    let mut eve = client(&hub);
+    verify_device(&hub, &mut eve, 3);
+    eve.send(&hub, join_msg(&code, "Eve", None));
+    assert!(matches!(eve.recv(), ServerMessage::LobbyWaiting { .. }));
+}
+
+#[test]
+fn report_event_whitelist() {
+    let (hub, mut events) = events_hub(HubConfig::default());
+    let mut host = client(&hub);
+    verify_device(&hub, &mut host, 1);
+    host.send(&hub, create_msg(None, false, false));
+    created(&mut host);
+    drain(&mut events);
+    host.send(
+        &hub,
+        ClientMessage::ReportEvent {
+            kind: "control_granted".into(),
+            subject: None,
+        },
+    );
+    assert!(
+        matches!(drain(&mut events).as_slice(), [HubEvent::Audit(a)] if a.kind == "control_granted")
+    );
+    host.send(
+        &hub,
+        ClientMessage::ReportEvent {
+            kind: "drop_tables".into(),
+            subject: None,
+        },
+    );
+    expect_error(&mut host, ErrorCode::InvalidMessage);
+}
+
+#[test]
+fn large_rooms_need_an_sfu() {
+    let hub = hub();
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, false, true));
+    expect_error(&mut host, ErrorCode::Unavailable);
+
+    let (hub, mut events) = events_hub(HubConfig {
+        sfu_available: true,
+        sfu_max_participants: 25,
+        ..Default::default()
+    });
+    let mut host = client(&hub);
+    host.send(&hub, create_msg(None, false, true));
+    let code = match host.recv() {
+        ServerMessage::RoomCreated {
+            room_id,
+            topology,
+            max_participants,
+            ..
+        } => {
+            assert_eq!(topology, Topology::Sfu);
+            assert_eq!(max_participants, 25);
+            room_id
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+    host.send(&hub, ClientMessage::SfuOffer { sdp: "v=0".into() });
+    assert!(matches!(
+        drain(&mut events).as_slice(),
+        [HubEvent::Sfu { room, signal: SfuSignal::Offer(_), .. }] if *room == code
+    ));
+    assert_eq!(hub.stats().sfu_rooms, 1);
+}
+
+#[test]
+fn sfu_signals_are_refused_in_mesh_rooms() {
+    let (hub, _events) = events_hub(HubConfig::default());
+    let (mut a, ..) = create(&hub);
+    a.send(&hub, ClientMessage::SfuOffer { sdp: "v=0".into() });
+    expect_error(&mut a, ErrorCode::Unavailable);
+}
+
+#[test]
+fn cluster_prefix_is_applied() {
+    let hub = hub_with(HubConfig {
+        code_prefix: Some(7),
+        ..Default::default()
+    });
+    let (_a, code, ..) = create(&hub);
+    assert!(code.starts_with('7'));
+    assert!(hub.has_room(&code));
+}
+
+#[test]
+fn metrics_count_activity() {
+    let hub = hub();
+    let (_a, code, ..) = create(&hub);
+    let _b = join(&hub, &code, "B");
+    let mut c = client(&hub);
+    c.send(&hub, join_msg("123456789", "C", None));
+    expect_error(&mut c, ErrorCode::RoomNotFound);
+    let m = hub.metrics();
+    let get = |name: &str| m.counters.iter().find(|c| c.0 == name).unwrap().2;
+    assert_eq!(get("connexa_rooms_created_total"), 1);
+    assert_eq!(get("connexa_joins_total"), 1);
+    assert_eq!(m.errors, vec![("room_not_found".to_string(), 1)]);
 }

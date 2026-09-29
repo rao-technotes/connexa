@@ -25,6 +25,35 @@ pub struct Config {
     /// Close a WebSocket that sends nothing (not even a ping) for this long.
     pub socket_idle_timeout: Duration,
     pub ice: IceConfig,
+    /// Postgres URL for device identities, trust and the audit log (memory store if unset).
+    pub database_url: Option<String>,
+    pub audit_retention_days: u32,
+    /// Redis URL for multi-node clustering (single node if unset).
+    pub redis_url: Option<String>,
+    /// Cluster slot 1-9, also the first digit of room codes created on this node.
+    pub node_slot: Option<u8>,
+    /// Bearer token required by `/metrics` (open if unset).
+    pub metrics_token: Option<String>,
+    pub sfu: SfuSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct SfuSettings {
+    pub enabled: bool,
+    /// Single UDP port all SFU media flows through.
+    pub udp_port: u16,
+    /// Public IP to advertise when the server sits behind 1:1 NAT (cloud VMs, Kubernetes).
+    pub public_ip: Option<std::net::IpAddr>,
+}
+
+impl Default for SfuSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            udp_port: 3479,
+            public_ip: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +81,12 @@ impl Default for Config {
                 turn_ttl: Duration::from_secs(6 * 60 * 60),
                 ..Default::default()
             },
+            database_url: None,
+            audit_retention_days: 90,
+            redis_url: None,
+            node_slot: None,
+            metrics_token: None,
+            sfu: SfuSettings::default(),
         }
     }
 }
@@ -101,6 +136,38 @@ impl Config {
         c.ice.turn_username = var("CONNEXA_TURN_USERNAME");
         c.ice.turn_credential = var("CONNEXA_TURN_CREDENTIAL");
         parse_secs(&mut c.ice.turn_ttl, "CONNEXA_TURN_TTL_SECS")?;
+
+        c.database_url = var("CONNEXA_DATABASE_URL");
+        parse_into(&mut c.audit_retention_days, "CONNEXA_AUDIT_RETENTION_DAYS")?;
+        c.redis_url = var("CONNEXA_REDIS_URL");
+        c.node_slot = match var("CONNEXA_NODE_SLOT") {
+            Some(v) => Some(v.parse().context("CONNEXA_NODE_SLOT")?),
+            // Kubernetes StatefulSet pods are named <name>-0, <name>-1, ...
+            None if c.redis_url.is_some() => var("HOSTNAME")
+                .and_then(|h| h.rsplit('-').next().and_then(|n| n.parse::<u8>().ok()))
+                .map(|ordinal| ordinal + 1),
+            None => None,
+        };
+        if c.redis_url.is_some() {
+            let slot = c.node_slot.context(
+                "clustering needs CONNEXA_NODE_SLOT (1-9) or a StatefulSet-style HOSTNAME",
+            )?;
+            anyhow::ensure!((1..=9).contains(&slot), "CONNEXA_NODE_SLOT must be 1-9");
+            c.hub.code_prefix = Some(slot);
+        }
+        c.metrics_token = var("CONNEXA_METRICS_TOKEN");
+        if let Some(v) = var("CONNEXA_SFU") {
+            c.sfu.enabled = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        parse_into(&mut c.sfu.udp_port, "CONNEXA_SFU_UDP_PORT")?;
+        if let Some(v) = var("CONNEXA_SFU_PUBLIC_IP") {
+            c.sfu.public_ip = Some(v.parse().context("CONNEXA_SFU_PUBLIC_IP")?);
+        }
+        parse_into(
+            &mut c.hub.sfu_max_participants,
+            "CONNEXA_SFU_MAX_PARTICIPANTS",
+        )?;
+        c.hub.sfu_available = c.sfu.enabled;
 
         anyhow::ensure!(
             c.hub.max_participants >= 2,

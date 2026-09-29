@@ -1,0 +1,118 @@
+# Signaling nodes. A StatefulSet gives each pod a stable ordinal; the server
+# turns `connexa-signaling-N` into cluster slot N+1, which is also the first
+# digit of every room code the pod creates. Any pod can accept any client:
+# joins for rooms owned by another pod are forwarded over Redis, so the
+# Service and Ingress need no sticky sessions. Up to 9 replicas.
+#
+# SFU media: each pod listens on UDP 3479 via hostPort (one pod per node,
+# enforced by anti-affinity) and advertises the node address. If your nodes'
+# addresses are private, set CONNEXA_SFU_PUBLIC_IP per node (e.g. with a
+# node-specific patch) or run the SFU on VMs with public IPs.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: connexa-signaling
+spec:
+  serviceName: connexa-signaling-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: connexa-signaling }
+  template:
+    metadata:
+      labels: { app: connexa-signaling }
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: connexa-signaling }
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: signaling
+          image: connexa-signaling
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: sfu
+              containerPort: 3479
+              hostPort: 3479
+              protocol: UDP
+          env:
+            - name: CONNEXA_REDIS_URL
+              value: redis://redis:6379
+            - name: CONNEXA_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: connexa, key: database-url }
+            - name: CONNEXA_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: { name: connexa, key: metrics-token }
+            - name: CONNEXA_TURN_SECRET
+              valueFrom:
+                secretKeyRef: { name: connexa, key: turn-secret }
+            - name: CONNEXA_TURN_URLS
+              value: turn:turn.connexa.example.com:3478?transport=udp,turn:turn.connexa.example.com:3478?transport=tcp
+            - name: CONNEXA_STUN_URLS
+              value: stun:turn.connexa.example.com:3478
+            - name: CONNEXA_ALLOWED_ORIGINS
+              value: https://connexa.example.com
+            - name: CONNEXA_TRUST_PROXY
+              value: "true"
+            - name: CONNEXA_SFU
+              value: "true"
+            - name: CONNEXA_SFU_PUBLIC_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 250m, memory: 128Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# Stable DNS for each pod (required by the StatefulSet).
+apiVersion: v1
+kind: Service
+metadata:
+  name: connexa-signaling-headless
+spec:
+  clusterIP: None
+  selector: { app: connexa-signaling }
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connexa-signaling
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: /metrics
+spec:
+  selector: { app: connexa-signaling }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: connexa-signaling
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: connexa-signaling }

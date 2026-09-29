@@ -1,6 +1,6 @@
 import { parseRemoteInput, type ControlPermission, type Monitor, type NativeAgent, type RemoteInput } from "./agent";
 import { Emitter } from "./emitter";
-import type { PeerMesh } from "./mesh";
+import type { MediaSession } from "./session";
 import type { ParticipantId } from "./protocol";
 
 /**
@@ -38,9 +38,11 @@ export class RemoteControl extends Emitter<Events> {
   private lastInjectError = 0;
 
   constructor(
-    private readonly mesh: PeerMesh,
+    private readonly mesh: MediaSession,
     private readonly agent: NativeAgent | undefined,
     private readonly nameOf: (id: ParticipantId) => string,
+    /** Records control events in this device's audit log. */
+    private readonly report: (kind: string, subject: ParticipantId) => void = () => {},
   ) {
     super();
     this.unsubscribe = [
@@ -73,6 +75,7 @@ export class RemoteControl extends Emitter<Events> {
     if (!ok) return this.deny(peerId, "declined");
     this.grants.set(peerId, permissions);
     this.mesh.send(peerId, { t: "control-grant", permissions });
+    this.report("control_granted", peerId);
     this.emit("grants", new Map(this.grants));
   }
 
@@ -83,6 +86,7 @@ export class RemoteControl extends Emitter<Events> {
   async revoke(peerId: ParticipantId, notify = true): Promise<void> {
     if (!this.grants.delete(peerId)) return;
     await this.agent?.revokeControl?.(peerId);
+    this.report("control_revoked", peerId);
     if (notify) this.mesh.send(peerId, { t: "control-revoke" });
     this.emit("grants", new Map(this.grants));
   }

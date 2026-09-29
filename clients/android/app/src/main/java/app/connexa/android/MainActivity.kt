@@ -6,6 +6,7 @@ import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -23,6 +24,7 @@ import android.webkit.WebView
 import android.widget.Toast
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -38,6 +40,14 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private var pendingPermission: PermissionRequest? = null
     private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val screen by lazy { NativeScreenShare(applicationContext) { event -> toPage(event) } }
+
+    /** Deliver a native event to the page (`window.__connexaNative`). */
+    private fun toPage(event: JSONObject) {
+        runOnUiThread {
+            webView.evaluateJavascript("window.__connexaNative && window.__connexaNative($event)", null)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -158,6 +168,21 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_SCREEN) {
+            if (resultCode != RESULT_OK || data == null) {
+                toPage(JSONObject().put("type", "denied"))
+                return
+            }
+            // Android 14+: the mediaProjection service must be in the foreground
+            // before capture starts, so start capturing once it reports ready.
+            ScreenCaptureService.onReady = {
+                val (w, h) = NativeScreenShare.captureSize(this)
+                screen.start(data, w, h)
+                toPage(JSONObject().put("type", "started"))
+            }
+            startForegroundService(Intent(this, ScreenCaptureService::class.java))
+            return
+        }
         if (requestCode != REQUEST_FILES) return
         val callback = fileCallback ?: return
         fileCallback = null
@@ -181,12 +206,44 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopScreen()
         webView.destroy()
         super.onDestroy()
     }
 
+    private fun stopScreen() {
+        if (screen.sharing) screen.stop()
+        stopService(Intent(this, ScreenCaptureService::class.java))
+    }
+
     /** Exposed to the page as `window.ConnexaAndroid`. Only our bundled page is ever loaded. */
     inner class Bridge {
+        @JavascriptInterface
+        fun screenStart(iceServersJson: String) {
+            runOnUiThread {
+                screen.setIceServers(iceServersJson)
+                val manager = getSystemService(MediaProjectionManager::class.java)
+                @Suppress("DEPRECATION")
+                startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_SCREEN)
+            }
+        }
+
+        @JavascriptInterface
+        fun screenOffer(peerId: String) = runOnUiThread { screen.offer(peerId) }
+
+        @JavascriptInterface
+        fun screenAnswer(peerId: String, sdp: String) = runOnUiThread { screen.answer(peerId, sdp) }
+
+        @JavascriptInterface
+        fun screenCandidate(peerId: String, candidateJson: String) =
+            runOnUiThread { screen.candidate(peerId, candidateJson) }
+
+        @JavascriptInterface
+        fun screenClose(peerId: String) = runOnUiThread { screen.close(peerId) }
+
+        @JavascriptInterface
+        fun screenStop() = runOnUiThread { stopScreen() }
+
         @JavascriptInterface
         fun saveFile(name: String, mime: String, base64: String): String {
             val bytes = Base64.decode(base64, Base64.DEFAULT)
@@ -219,6 +276,7 @@ class MainActivity : Activity() {
         private const val APP_HOST = "appassets.androidplatform.net"
         private const val REQUEST_MEDIA = 1
         private const val REQUEST_FILES = 2
+        private const val REQUEST_SCREEN = 3
 
         fun sanitize(name: String): String {
             val cleaned = name.map { if (it.isISOControl() || "<>:\"/\\|?*".contains(it)) '_' else it }

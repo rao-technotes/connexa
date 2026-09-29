@@ -14,16 +14,65 @@ that risk:
   per minute (configurable). With 1,000 live rooms, one IP guessing nonstop at
   that limit hits *some* room about once a month. An attacker with many IPs
   does proportionally better. A code alone is fine for casual sessions, but it
-  isn't strong access control, hence the PIN/lobby plans below.
-- **Small rooms.** The MVP caps rooms at 3 participants.
+  isn't strong access control. Use a PIN and/or the lobby (below) for
+  anything sensitive, and always for remote support.
+- **Small rooms.** Mesh rooms hold 3 participants; large (SFU) rooms 25.
 - **Short lifetimes.** Rooms close when the host leaves or ends them, after 30
   minutes without signaling activity, or after 12 hours regardless.
 - **Redacted logs.** Codes appear only as `847***653`. SDP, ICE candidates,
   names and chat are never logged.
 
-Planned for high-security sessions: an optional host-set PIN, host approval of
-each joiner (a "lobby"), and verifying DTLS fingerprints with a short
-authentication string shown to both users.
+## PIN and lobby
+
+- **PIN.** The host can set a 4–8 digit PIN when starting a session. Joiners
+  must enter it, and it's compared in constant time. After 5 wrong PINs the
+  room pauses new joins for 5 minutes, on top of the per-IP rate limit. PINs
+  are never stored in logs or on disk, and the client never remembers them.
+- **Lobby.** With *Ask me before people join*, joiners wait until the host
+  clicks **Admit** or **Deny**. The host sees each joiner's name and whether
+  their device is verified. A waiting joiner receives nothing from the room.
+- **Trusted devices** skip the lobby (never the PIN). Trust is per host
+  device and can be removed at any time from **This device**.
+
+## Device identity
+
+Each client generates an ECDSA P-256 key pair on first use and keeps it in
+IndexedDB as a **non-extractable** WebCrypto key. Page script can sign with it
+but can't read or export it. On every connection the server sends a random
+nonce, the client signs `"connexa-device-auth:" + nonce`, and the server
+verifies the signature. The device ID is the first 64 bits of SHA-256 over the
+public key, so it can't be claimed without the private key. Verified
+participants show a shield next to their name.
+
+This identifies **devices**, not people: anyone using the same browser
+profile has the same device ID. Clearing site data creates a new identity.
+Accounts, if ever added, would sit on top of this.
+
+## Audit log
+
+With a database configured, the server records per-device events: sessions
+started, joins, lobby decisions, wrong PINs, and remote-control grants and
+revocations. Clients report their peer-to-peer events. Entries reference a
+**hash** of the room code and device IDs, never the code, chat or file
+contents. A device can read only events where it is the actor or the subject
+(**This device → Recent activity**). Entries older than
+`CONNEXA_AUDIT_RETENTION_DAYS` (default 90) are deleted automatically.
+
+## Large rooms and the SFU
+
+In mesh rooms, media and data are end-to-end encrypted between browsers. The
+server never sees them.
+
+In large (SFU) rooms, each connection is encrypted **to the server**. The
+SFU decrypts and re-encrypts media and relays data channels, so whoever runs
+the server could technically access audio, video, chat and relayed files.
+The UI labels chat in these rooms as *relayed by the server*. Use mesh rooms
+(up to 3 people) when the operator mustn't be able to see the content.
+End-to-end encryption through the SFU (WebRTC encoded transforms, SFrame) is
+a possible future addition.
+
+Still to come for high-security sessions: verifying DTLS fingerprints with a
+short authentication string shown to both users.
 
 ## Transport
 

@@ -1,64 +1,18 @@
-import { randomId } from "./format";
-import { Emitter } from "./emitter";
 import type { IceServerConfig, ParticipantId, ParticipantInfo } from "./protocol";
+import { MediaSession, type PeerMessage, type RouteType, type StreamKind } from "./session";
 import type { SignalingClient } from "./signaling";
 
-/** "camera" carries mic + camera tracks, "screen" carries the screen share. */
-export type StreamKind = "camera" | "screen";
-export type RouteType = "direct" | "relay" | "unknown";
+export type { ChatMessage, MediaState, PeerMessage, RouteType, StreamKind } from "./session";
 
-export interface MediaState {
-  mic: boolean;
-  cam: boolean;
-  screen: boolean;
-  /** This participant's shared screen can be remote-controlled (native agent + whole monitor shared). */
-  control: boolean;
-}
-
-export interface ChatMessage {
-  id: string;
-  from: ParticipantId;
-  text: string;
-  ts: number;
-}
-
-/**
- * Messages exchanged peer-to-peer over the control data channel (never via the server).
- * The mesh handles chat/stream/state itself; everything else is surfaced as a
- * "message" event for feature modules (file transfer, remote control, clipboard).
- */
-export type PeerMessage =
-  | { t: "chat"; id: string; text: string; ts: number }
-  | { t: "stream"; streamId: string; kind: StreamKind }
-  | ({ t: "state" } & MediaState)
-  | { t: string; [key: string]: unknown };
-
-type Events = {
-  "peer-added": ParticipantId;
-  "peer-removed": ParticipantId;
-  "peer-state": { id: ParticipantId; state: RTCPeerConnectionState; route: RouteType };
-  "local-stream": { kind: StreamKind; stream: MediaStream | null };
-  "local-media": MediaState;
-  "remote-stream": { peerId: ParticipantId; stream: MediaStream; kind: StreamKind };
-  "remote-stream-removed": { peerId: ParticipantId; streamId: string };
-  "remote-media": { peerId: ParticipantId; state: MediaState };
-  chat: ChatMessage;
-  /** A peer message not handled by the mesh itself. Untrusted: validate before use. */
-  message: { peerId: ParticipantId; msg: { t: string; [key: string]: unknown } };
-  /** A data channel opened by the remote peer (e.g. a file transfer). */
-  channel: { peerId: ParticipantId; channel: RTCDataChannel };
-};
-
-const MAX_CHAT_CHARS = 4000;
-/** Upper bound for any control-channel message (clipboard text is the largest). */
-const MAX_MESSAGE_CHARS = 256 * 1024;
+/** Messages queued per peer while its data channel is still opening. */
+const MAX_QUEUED = 256;
 
 class Peer {
   readonly pc: RTCPeerConnection;
   readonly channel: RTCDataChannel;
   readonly senders = new Map<string, RTCRtpSender>();
-  readonly remoteStreams = new Map<string, MediaStream>();
-  readonly remoteKinds = new Map<string, StreamKind>();
+  /** Messages sent before the data channel opened. */
+  outbox: string[] = [];
   route: RouteType = "unknown";
   makingOffer = false;
   ignoreOffer = false;
@@ -80,19 +34,18 @@ class Peer {
 /**
  * Full-mesh WebRTC for small rooms: one RTCPeerConnection per remote participant.
  */
-export class PeerMesh extends Emitter<Events> {
+export class PeerMesh extends MediaSession {
+  readonly topology = "mesh" as const;
   private peers = new Map<ParticipantId, Peer>();
-  private local = new Map<StreamKind, MediaStream>();
-  private media: MediaState = { mic: false, cam: false, screen: false, control: false };
   private statsTimer: number;
   private unsubscribe: Array<() => void> = [];
 
   constructor(
     private readonly signaling: SignalingClient,
-    private readonly selfId: ParticipantId,
-    private readonly iceServers: IceServerConfig[],
+    selfId: ParticipantId,
+    iceServers: IceServerConfig[],
   ) {
-    super();
+    super(selfId, iceServers);
     this.unsubscribe.push(
       signaling.on("participant-joined", (p) => this.addPeer(p.participant_id)),
       signaling.on("participant-left", (id) => this.removePeer(id)),
@@ -104,32 +57,20 @@ export class PeerMesh extends Emitter<Events> {
     this.statsTimer = window.setInterval(() => void this.refreshRoutes(), 3000);
   }
 
-  get mediaState(): MediaState {
-    return { ...this.media };
-  }
-
   peerIds(): ParticipantId[] {
     return [...this.peers.keys()];
   }
 
-  /** The shared screen track's settings (surface type, size), if sharing. */
-  get screenSettings(): MediaTrackSettings | null {
-    return this.local.get("screen")?.getVideoTracks()[0]?.getSettings() ?? null;
-  }
-
-  /** Whether remote control of our shared screen is currently offered to peers. */
-  setControlAvailable(available: boolean): void {
-    if (this.media.control !== available) this.setMedia({ control: available });
-  }
-
   send(peerId: ParticipantId, msg: PeerMessage): boolean {
     const peer = this.peers.get(peerId);
-    if (!peer || peer.channel.readyState !== "open") return false;
-    peer.channel.send(JSON.stringify(msg));
-    return true;
+    if (!peer) return false;
+    return this.sendTo(peer, msg);
   }
 
-  /** Open an extra reliable data channel to one peer (arrives as a "channel" event there). */
+  broadcast(msg: PeerMessage): void {
+    for (const peer of this.peers.values()) this.sendTo(peer, msg);
+  }
+
   createChannel(peerId: ParticipantId, label: string): RTCDataChannel | null {
     const peer = this.peers.get(peerId);
     if (!peer || peer.pc.connectionState === "closed") return null;
@@ -140,119 +81,29 @@ export class PeerMesh extends Emitter<Events> {
     participants.forEach((p) => this.addPeer(p.participant_id));
   }
 
-  // ----- local media ---------------------------------------------------
+  protected onLocalTrackAdded(track: MediaStreamTrack, stream: MediaStream, kind: StreamKind): void {
+    for (const peer of this.peers.values()) this.addTrack(peer, track, stream, kind);
+  }
 
-  async setMic(on: boolean): Promise<void> {
-    const stream = this.cameraStream();
-    let track = stream.getAudioTracks()[0];
-    if (on && !track) {
-      const captured = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      track = captured.getAudioTracks()[0];
-      stream.addTrack(track);
-      this.addTrackToPeers(track, stream);
-      this.emit("local-stream", { kind: "camera", stream });
+  protected onLocalTrackRemoved(track: MediaStreamTrack): void {
+    for (const peer of this.peers.values()) {
+      const sender = peer.senders.get(track.id);
+      if (!sender) continue;
+      peer.senders.delete(track.id);
+      if (peer.pc.signalingState !== "closed") peer.pc.removeTrack(sender);
     }
-    // Muting keeps the sender (no renegotiation) and just sends silence.
-    if (track) track.enabled = on;
-    this.setMedia({ mic: on });
   }
 
-  async setCamera(on: boolean): Promise<void> {
-    const stream = this.cameraStream();
-    const existing = stream.getVideoTracks()[0];
-    if (on && !existing) {
-      const captured = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      });
-      const track = captured.getVideoTracks()[0];
-      stream.addTrack(track);
-      this.addTrackToPeers(track, stream);
-    } else if (!on && existing) {
-      // Stop the track so the camera light turns off.
-      existing.stop();
-      stream.removeTrack(existing);
-      this.removeTrackFromPeers(existing);
-    }
-    this.emit("local-stream", { kind: "camera", stream });
-    this.setMedia({ cam: on });
-  }
-
-  async startScreenShare(): Promise<void> {
-    if (this.local.has("screen")) return;
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 30 } },
-      audio: true,
-    });
-    const video = stream.getVideoTracks()[0];
-    // Optimize for desktop text rather than motion.
-    if (video && "contentHint" in video) video.contentHint = "detail";
-    video?.addEventListener("ended", () => this.stopScreenShare());
-
-    this.local.set("screen", stream);
-    this.broadcast({ t: "stream", streamId: stream.id, kind: "screen" });
-    stream.getTracks().forEach((t) => this.addTrackToPeers(t, stream));
-    this.emit("local-stream", { kind: "screen", stream });
-    this.setMedia({ screen: true });
-  }
-
-  stopScreenShare(): void {
-    const stream = this.local.get("screen");
-    if (!stream) return;
-    this.media.control = false;
-    this.local.delete("screen");
-    stream.getTracks().forEach((t) => {
-      t.stop();
-      this.removeTrackFromPeers(t);
-    });
-    this.emit("local-stream", { kind: "screen", stream: null });
-    this.setMedia({ screen: false });
-  }
-
-  // ----- chat ----------------------------------------------------------
-
-  sendChat(text: string): void {
-    const trimmed = text.trim().slice(0, MAX_CHAT_CHARS);
-    if (!trimmed) return;
-    const msg: ChatMessage = { id: randomId(), from: this.selfId, text: trimmed, ts: Date.now() };
-    this.broadcast({ t: "chat", id: msg.id, text: msg.text, ts: msg.ts });
-    this.emit("chat", msg);
-  }
-
-  // ----- lifecycle -----------------------------------------------------
-
-  close(): void {
+  protected dispose(): void {
     window.clearInterval(this.statsTimer);
     this.unsubscribe.forEach((u) => u());
     for (const id of [...this.peers.keys()]) this.removePeer(id);
-    for (const stream of this.local.values()) stream.getTracks().forEach((t) => t.stop());
-    this.local.clear();
   }
 
-  private cameraStream(): MediaStream {
-    let stream = this.local.get("camera");
-    if (!stream) {
-      stream = new MediaStream();
-      this.local.set("camera", stream);
-    }
-    return stream;
-  }
-
-  private setMedia(patch: Partial<MediaState>): void {
-    this.media = { ...this.media, ...patch };
-    this.broadcast({ t: "state", ...this.media });
-    this.emit("local-media", this.mediaState);
-  }
-
-  private addTrackToPeers(track: MediaStreamTrack, stream: MediaStream): void {
-    for (const peer of this.peers.values()) this.addTrack(peer, track, stream);
-  }
-
-  private addTrack(peer: Peer, track: MediaStreamTrack, stream: MediaStream): void {
+  private addTrack(peer: Peer, track: MediaStreamTrack, stream: MediaStream, kind: StreamKind): void {
     const sender = peer.pc.addTrack(track, stream);
     peer.senders.set(track.id, sender);
-    if (stream === this.local.get("screen") && track.kind === "video") {
+    if (kind === "screen" && track.kind === "video") {
       // Keep text legible: drop frame rate before resolution when bandwidth is short.
       const params = sender.getParameters();
       params.degradationPreference = "maintain-resolution";
@@ -260,13 +111,18 @@ export class PeerMesh extends Emitter<Events> {
     }
   }
 
-  private removeTrackFromPeers(track: MediaStreamTrack): void {
-    for (const peer of this.peers.values()) {
-      const sender = peer.senders.get(track.id);
-      if (!sender) continue;
-      peer.senders.delete(track.id);
-      if (peer.pc.signalingState !== "closed") peer.pc.removeTrack(sender);
+  /** Send now, or queue until the channel opens. */
+  private sendTo(peer: Peer, msg: PeerMessage): boolean {
+    const state = peer.channel.readyState;
+    if (state === "open") {
+      peer.channel.send(JSON.stringify(msg));
+      return true;
     }
+    if (state === "connecting" && peer.outbox.length < MAX_QUEUED) {
+      peer.outbox.push(JSON.stringify(msg));
+      return true;
+    }
+    return false;
   }
 
   // ----- peers ---------------------------------------------------------
@@ -298,18 +154,22 @@ export class PeerMesh extends Emitter<Events> {
       this.emitPeerState(peer);
       if (pc.connectionState === "connected") void this.refreshRoutes();
     };
-    pc.ontrack = ({ track, streams }) => this.onRemoteTrack(peer, track, streams[0]);
+    pc.ontrack = ({ track, streams }) => {
+      const stream = streams[0] ?? new MediaStream([track]);
+      this.remoteTrack(id, stream, stream.id);
+    };
 
     channel.onopen = () => {
-      // Tell the new peer what our streams are and our current mic/cam state.
-      for (const [kind, stream] of this.local) this.sendTo(peer, { t: "stream", streamId: stream.id, kind });
-      this.sendTo(peer, { t: "state", ...this.media });
+      // Tell the new peer what our streams are and our current mic/cam state,
+      // then deliver anything queued before the channel opened.
+      for (const msg of this.introduction()) this.sendTo(peer, msg);
+      for (const queued of peer.outbox.splice(0)) channel.send(queued);
     };
-    channel.onmessage = (ev) => this.onChannelMessage(peer, ev.data);
-    pc.ondatachannel = ({ channel: extra }) => this.emit("channel", { peerId: id, channel: extra });
+    channel.onmessage = (ev) => this.peerMessage(id, ev.data);
+    pc.ondatachannel = ({ channel: extra }) => this.emit("channel", { peerId: id, channel: extra, label: extra.label });
 
-    for (const stream of this.local.values()) {
-      stream.getTracks().forEach((t) => this.addTrack(peer, t, stream));
+    for (const [kind, stream] of this.local) {
+      stream.getTracks().forEach((t) => this.addTrack(peer, t, stream, kind));
     }
     this.emit("peer-added", id);
     this.emitPeerState(peer);
@@ -321,7 +181,7 @@ export class PeerMesh extends Emitter<Events> {
     if (!peer) return;
     this.peers.delete(id);
     peer.pc.close();
-    for (const streamId of peer.remoteStreams.keys()) this.emit("remote-stream-removed", { peerId: id, streamId });
+    this.forgetPeer(id);
     this.emit("peer-removed", id);
   }
 
@@ -368,72 +228,6 @@ export class PeerMesh extends Emitter<Events> {
         if (!peer.ignoreOffer) console.warn("failed to add ICE candidate", err);
       }
     });
-  }
-
-  private onRemoteTrack(peer: Peer, track: MediaStreamTrack, stream: MediaStream | undefined): void {
-    const s = stream ?? new MediaStream([track]);
-    if (!peer.remoteStreams.has(s.id)) {
-      peer.remoteStreams.set(s.id, s);
-      s.addEventListener("removetrack", () => {
-        if (s.getTracks().length === 0 && peer.remoteStreams.delete(s.id)) {
-          this.emit("remote-stream-removed", { peerId: peer.id, streamId: s.id });
-        }
-      });
-    }
-    this.emit("remote-stream", { peerId: peer.id, stream: s, kind: peer.remoteKinds.get(s.id) ?? "camera" });
-  }
-
-  private onChannelMessage(peer: Peer, data: unknown): void {
-    if (typeof data !== "string" || data.length > MAX_MESSAGE_CHARS) return;
-    let msg: PeerMessage;
-    try {
-      msg = JSON.parse(data);
-    } catch {
-      return;
-    }
-    // Peers are untrusted: validate before use.
-    switch (msg?.t) {
-      case "chat":
-        if (typeof msg.text === "string" && typeof msg.id === "string") {
-          this.emit("chat", {
-            id: msg.id,
-            from: peer.id,
-            text: msg.text.slice(0, MAX_CHAT_CHARS),
-            ts: Number(msg.ts) || Date.now(),
-          });
-        }
-        break;
-      case "stream":
-        if (typeof msg.streamId === "string" && (msg.kind === "camera" || msg.kind === "screen")) {
-          peer.remoteKinds.set(msg.streamId, msg.kind);
-          const stream = peer.remoteStreams.get(msg.streamId);
-          if (stream) this.emit("remote-stream", { peerId: peer.id, stream, kind: msg.kind });
-        }
-        break;
-      case "state":
-        this.emit("remote-media", {
-          peerId: peer.id,
-          state: {
-            mic: msg.mic === true,
-            cam: msg.cam === true,
-            screen: msg.screen === true,
-            control: msg.control === true,
-          },
-        });
-        break;
-      default:
-        if (typeof msg?.t === "string") {
-          this.emit("message", { peerId: peer.id, msg: msg as { t: string; [key: string]: unknown } });
-        }
-    }
-  }
-
-  broadcast(msg: PeerMessage): void {
-    for (const peer of this.peers.values()) this.sendTo(peer, msg);
-  }
-
-  private sendTo(peer: Peer, msg: PeerMessage): void {
-    if (peer.channel.readyState === "open") peer.channel.send(JSON.stringify(msg));
   }
 
   private emitPeerState(peer: Peer): void {
